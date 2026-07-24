@@ -17,9 +17,9 @@ subprojects {
     project.evaluationDependsOn(":app")
 
     afterEvaluate {
-        // ✅ Force compileSdk 36 on all Android modules (plugins + app)
-        extensions.findByType<com.android.build.api.dsl.CommonExtension<*, *, *, *, *, *>>()?.apply {
-            compileSdk = 36
+        @Suppress("DEPRECATION")
+        extensions.findByType<com.android.build.gradle.BaseExtension>()?.apply {
+            compileSdkVersion(36)   // ✅ method call, not property assignment
         }
     }
 }
