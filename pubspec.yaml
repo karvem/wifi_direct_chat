@@ -1,32 +1,34 @@
-name: wifi_direct_chat
-description: A Wi-Fi Direct chat app
-version: 1.0.0+1
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
 
-environment:
-  sdk: ">=3.7.0 <4.0.0"
+val newBuildDir: Directory =
+    rootProject.layout.buildDirectory
+        .dir("../../build")
+        .get()
+rootProject.layout.buildDirectory.value(newBuildDir)
 
-dependencies:
-  flutter:
-    sdk: flutter
+subprojects {
+    val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
+    project.layout.buildDirectory.value(newSubprojectBuildDir)
+}
 
-  wifi_direct_plugin: ^0.1.7   # ✅ REPLACEMENT — Dart 3 + null safe
-  permission_handler: ^12.0.1
-  file_picker: ^10.2.0
-  path_provider: ^2.1.0
-  encryptify: ^0.0.4
-  flutter_secure_storage: ^9.0.0
-  hive: ^2.2.0
-  hive_flutter: ^1.1.0
-  uuid: ^4.0.0
-  flutter_sound: ^9.2.13
-  device_info_plus: ^11.5.0
+subprojects {
+    afterEvaluate {
+        // ✅ Force compileSdk 36 on every Android module (app + plugins)
+        if (extensions.findByName("android") != null) {
+            @Suppress("DEPRECATION")
+            extensions.findByType<com.android.build.gradle.BaseExtension>()?.apply {
+                compileSdkVersion(36)
+            }
+        }
+    }
+    project.evaluationDependsOn(":app")
+}
 
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^3.0.0
-  hive_generator: ^2.0.0
-  build_runner: ^2.4.0
-
-flutter:
-  uses-material-design: true
+tasks.register<Delete>("clean") {
+    delete(rootProject.layout.buildDirectory)
+}
