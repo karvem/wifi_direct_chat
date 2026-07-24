@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_p2p_connection/flutter_p2p_connection.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path_provider/path_provider.dart';
@@ -240,7 +241,7 @@ class WifiDirectApp extends StatelessWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  HOME SCREEN — Unified Host/Client with flutter_p2p_connection v3
+//  HOME SCREEN
 // ═══════════════════════════════════════════════════════════════════════════════
 
 enum P2pRole { none, host, client }
@@ -269,16 +270,18 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Contact> _contacts = [];
   List<ChatMessage> _messages = [];
-  List<dynamic> _discoveredHosts = []; // ✅ dynamic — BleDiscoveredDevice fields vary
-  List<P2pClientInfo> _groupClients = []; // host only: who joined
+  List<dynamic> _discoveredHosts = [];
+  List<P2pClientInfo> _groupClients = [];
   Contact? _selectedContact;
 
   // Voice
   final FlutterSoundRecorder _audioRecorder = FlutterSoundRecorder();
   bool _isRecordingVoiceMessage = false;
-
-  // Call state (placeholder)
   bool _isInCall = false;
+
+  // Debug log buffer (in-app console)
+  final List<String> _debugLogs = [];
+  final ScrollController _debugScrollCtrl = ScrollController();
 
   // Subscriptions
   StreamSubscription? _hostStateSub;
@@ -288,6 +291,16 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription? _clientTextSub;
   StreamSubscription? _clientListSub;
   StreamSubscription? _scanSub;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  DEBUG HELPERS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  void _log(String msg) {
+    final line = '[${DateTime.now().toIso8601String().substring(11, 19)}] $msg';
+    _debugLogs.add(line);
+    debugPrint(line);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   //  LIFECYCLE
@@ -300,37 +313,45 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _initialize() async {
-    // 1. Permissions
+    _log('INIT: requesting permissions...');
     await _requestPermissions();
 
-    // 2. Hive
     _contactBox = Hive.box<Contact>('contacts');
     _messageBox = Hive.box<ChatMessage>('messages');
     _loadContacts();
     _loadMessages();
 
-    // 3. Device ID & Keys
     _myDeviceId = await EncryptionService.getMyDeviceId();
     await EncryptionService.ensureKeys();
+    _log('INIT: deviceId=$_myDeviceId');
 
-    // 4. Audio
     await _audioRecorder.openRecorder();
 
-    // 5. Initialize both P2P instances (lightweight, no group created yet)
+    _log('INIT: initializing host...');
     await _host.initialize();
+    _log('INIT: host initialized');
+
+    _log('INIT: initializing client...');
     await _client.initialize();
+    _log('INIT: client initialized');
 
     setState(() => _status = 'Device ID: $_myDeviceId — Choose Host or Client');
   }
 
   Future<void> _requestPermissions() async {
-    await Permission.microphone.request();
-    await Permission.location.request();
-    await Permission.nearbyWifiDevices.request();
-    await Permission.storage.request();
-    await Permission.bluetoothScan.request();
-    await Permission.bluetoothConnect.request();
-    await Permission.bluetoothAdvertise.request();
+    final perms = [
+      Permission.microphone,
+      Permission.location,
+      Permission.nearbyWifiDevices,
+      Permission.storage,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.bluetoothAdvertise,
+    ];
+    for (final p in perms) {
+      final status = await p.request();
+      _log('PERM: ${p.toString()} = ${status.toString()}');
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -338,52 +359,81 @@ class _HomeScreenState extends State<HomeScreen> {
   // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _startAsHost() async {
+    _log('HOST: starting...');
     setState(() => _status = 'Starting as Host...');
 
-    // Ensure services are on
-    if (!await _host.checkWifiEnabled()) await _host.enableWifiServices();
-    if (!await _host.checkLocationEnabled()) await _host.enableLocationServices();
-    if (!await _host.checkBluetoothEnabled()) await _host.enableBluetoothServices();
+    if (!await _host.checkWifiEnabled()) {
+      _log('HOST: WiFi off, enabling...');
+      await _host.enableWifiServices();
+    }
+    if (!await _host.checkLocationEnabled()) {
+      _log('HOST: Location off, enabling...');
+      await _host.enableLocationServices();
+    }
+    if (!await _host.checkBluetoothEnabled()) {
+      _log('HOST: Bluetooth off, enabling...');
+      await _host.enableBluetoothServices();
+    }
 
-    // Request runtime permissions via plugin helpers
-    if (!await _host.checkP2pPermissions()) await _host.askP2pPermissions();
-    if (!await _host.checkBluetoothPermissions()) await _host.askBluetoothPermissions();
+    if (!await _host.checkP2pPermissions()) {
+      _log('HOST: requesting P2P permissions...');
+      await _host.askP2pPermissions();
+    }
+    if (!await _host.checkBluetoothPermissions()) {
+      _log('HOST: requesting BLE permissions...');
+      await _host.askBluetoothPermissions();
+    }
 
-    // Create Wi-Fi Direct group + advertise via BLE so clients can find us
-    final state = await _host.createGroup(advertise: true);
-    debugPrint('HOST createGroup state: $state');
-
-    _role = P2pRole.host;
-    _listenAsHost();
-    setState(() => _status = 'Host active — SSID: ${state.ssid ?? '...'}');
+    _log('HOST: creating group + advertising via BLE...');
+    try {
+      final state = await _host.createGroup(advertise: true);
+      _log('HOST: createGroup returned: ssid=${state.ssid}, ip=${state.hostIp}, active=${state.isActive}, reason=${state.failureReason}');
+      _role = P2pRole.host;
+      _listenAsHost();
+      setState(() => _status = 'Host active — SSID: ${state.ssid ?? '...'}');
+    } catch (e, st) {
+      _log('HOST: createGroup FAILED: $e');
+      _log('HOST: stack: $st');
+      setState(() => _status = 'Host failed: $e');
+    }
   }
 
   void _listenAsHost() {
-    // Track hotspot state (active / failed)
-    _hostStateSub = _host.streamHotspotState().listen((state) {
-      debugPrint('HOST STATE: active=${state.isActive}, reason=${state.failureReason}');
-      setState(() {
-        _isConnected = state.isActive;
-        if (!state.isActive && state.failureReason != null) {
-          _status = 'Host failed: ${state.failureReason}';
+    _log('HOST: setting up listeners...');
+
+    _hostStateSub = _host.streamHotspotState().listen(
+      (state) {
+        _log('HOST STATE: active=${state.isActive}, ssid=${state.ssid}, ip=${state.hostIp}, reason=${state.failureReason}');
+        setState(() {
+          _isConnected = state.isActive;
+          if (!state.isActive && state.failureReason != null) {
+            _status = 'Host failed: ${state.failureReason}';
+          }
+        });
+      },
+      onError: (e) => _log('HOST STATE ERROR: $e'),
+    );
+
+    _hostClientsSub = _host.streamClientList().listen(
+      (clients) {
+        _log('HOST CLIENTS: ${clients.length} connected');
+        for (final c in clients) {
+          _log('  → client id=${c.id}, username=${c.username}, isHost=${c.isHost}');
         }
-      });
-    });
+        setState(() => _groupClients = clients);
+        for (final c in clients) {
+          _ensureContactFromClientInfo(c);
+        }
+      },
+      onError: (e) => _log('HOST CLIENTS ERROR: $e'),
+    );
 
-    // Track who joins the group
-    _hostClientsSub = _host.streamClientList().listen((clients) {
-      debugPrint('HOST CLIENTS: ${clients.length} connected');
-      setState(() => _groupClients = clients);
-      for (final c in clients) {
-        _ensureContactFromClientInfo(c);
-      }
-    });
-
-    // Receive text messages from clients
-    _hostTextSub = _host.streamReceivedTexts().listen((text) {
-      debugPrint('HOST RECEIVED: $text');
-      _handleIncomingMessage(text, fromHost: false);
-    });
+    _hostTextSub = _host.streamReceivedTexts().listen(
+      (text) => _log('HOST RECEIVED TEXT: "$text"'),
+      onError: (e) => _log('HOST TEXT ERROR: $e'),
+      onDone: () => _log('HOST TEXT STREAM CLOSED'),
+    );
+    _log('HOST: listeners active');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -391,52 +441,82 @@ class _HomeScreenState extends State<HomeScreen> {
   // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _startAsClient() async {
+    _log('CLIENT: starting...');
     setState(() => _status = 'Starting as Client...');
 
-    if (!await _client.checkWifiEnabled()) await _client.enableWifiServices();
-    if (!await _client.checkLocationEnabled()) await _client.enableLocationServices();
-    if (!await _client.checkBluetoothEnabled()) await _client.enableBluetoothServices();
+    if (!await _client.checkWifiEnabled()) {
+      _log('CLIENT: WiFi off, enabling...');
+      await _client.enableWifiServices();
+    }
+    if (!await _client.checkLocationEnabled()) {
+      _log('CLIENT: Location off, enabling...');
+      await _client.enableLocationServices();
+    }
+    if (!await _client.checkBluetoothEnabled()) {
+      _log('CLIENT: Bluetooth off, enabling...');
+      await _client.enableBluetoothServices();
+    }
 
-    if (!await _client.checkP2pPermissions()) await _client.askP2pPermissions();
-    if (!await _client.checkBluetoothPermissions()) await _client.askBluetoothPermissions();
+    if (!await _client.checkP2pPermissions()) {
+      _log('CLIENT: requesting P2P permissions...');
+      await _client.askP2pPermissions();
+    }
+    if (!await _client.checkBluetoothPermissions()) {
+      _log('CLIENT: requesting BLE permissions...');
+      await _client.askBluetoothPermissions();
+    }
 
     _role = P2pRole.client;
     _listenAsClient();
 
-    // Start BLE scan for hosts
-    _scanSub = await _client.startScan((devices) {
-      debugPrint('CLIENT SCAN: ${devices.length} hosts found');
-      setState(() => _discoveredHosts = devices);
-    });
-
-    setState(() => _status = 'Client scanning for hosts...');
+    _log('CLIENT: starting BLE scan...');
+    try {
+      _scanSub = await _client.startScan((devices) {
+        _log('CLIENT SCAN: ${devices.length} hosts found');
+        for (final d in devices) {
+          _log('  → device fields: ${d.toString()}');
+        }
+        setState(() => _discoveredHosts = devices);
+      });
+      setState(() => _status = 'Client scanning for hosts...');
+    } catch (e, st) {
+      _log('CLIENT SCAN FAILED: $e');
+      _log('$st');
+    }
   }
 
   void _listenAsClient() {
-    // Track connection to host
-    _clientStateSub = _client.streamHotspotState().listen((state) {
-      debugPrint('CLIENT STATE: active=${state.isActive}, ssid=${state.hostSsid}');
-      setState(() {
-        _isConnected = state.isActive;
-        _status = state.isActive
-            ? 'Connected to ${state.hostSsid ?? 'host'}'
-            : 'Disconnected / Scanning...';
-      });
-    });
+    _log('CLIENT: setting up listeners...');
 
-    // Receive text messages from host / other clients
-    _clientTextSub = _client.streamReceivedTexts().listen((text) {
-      debugPrint('CLIENT RECEIVED: $text');
-      _handleIncomingMessage(text, fromHost: true);
-    });
+    _clientStateSub = _client.streamHotspotState().listen(
+      (state) {
+        _log('CLIENT STATE: active=${state.isActive}, ssid=${state.hostSsid}, myIp=${state.clientIp}');
+        setState(() {
+          _isConnected = state.isActive;
+          _status = state.isActive
+              ? 'Connected to ${state.hostSsid ?? 'host'}'
+              : 'Disconnected / Scanning...';
+        });
+      },
+      onError: (e) => _log('CLIENT STATE ERROR: $e'),
+    );
 
-    // Track group participants (optional, for UI)
-    _clientListSub = _client.streamClientList().listen((clients) {
-      debugPrint('CLIENT PEERS: ${clients.length} in group');
-      for (final c in clients) {
-        if (!c.isHost) _ensureContactFromClientInfo(c);
-      }
-    });
+    _clientTextSub = _client.streamReceivedTexts().listen(
+      (text) => _log('CLIENT RECEIVED TEXT: "$text"'),
+      onError: (e) => _log('CLIENT TEXT ERROR: $e'),
+      onDone: () => _log('CLIENT TEXT STREAM CLOSED'),
+    );
+
+    _clientListSub = _client.streamClientList().listen(
+      (clients) {
+        _log('CLIENT PEERS: ${clients.length} in group');
+        for (final c in clients) {
+          _log('  → peer id=${c.id}, username=${c.username}, isHost=${c.isHost}');
+        }
+      },
+      onError: (e) => _log('CLIENT PEERS ERROR: $e'),
+    );
+    _log('CLIENT: listeners active');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -444,13 +524,17 @@ class _HomeScreenState extends State<HomeScreen> {
   // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _connectToHost(dynamic device) async {
-    // ✅ dynamic with safe field extraction — plugin docs lie about field names
     final name = device.deviceName?.toString() ?? device.name?.toString() ?? 'Unknown Host';
     final address = device.deviceAddress?.toString() ?? device.macAddress?.toString() ?? device.id?.toString() ?? '';
 
+    _log('CLIENT CONNECT: connecting to $name @ $address');
     setState(() => _status = 'Connecting to $name...');
+
     try {
+      _log('CLIENT CONNECT: calling connectWithDevice...');
       await _client.connectWithDevice(device);
+      _log('CLIENT CONNECT: connectWithDevice returned');
+
       final contact = Contact(
         uniqueId: address.isNotEmpty ? address : const Uuid().v4(),
         displayName: name,
@@ -460,7 +544,10 @@ class _HomeScreenState extends State<HomeScreen> {
       await _contactBox.put(contact.uniqueId, contact);
       _loadContacts();
       setState(() => _selectedContact = contact);
-    } catch (e) {
+      _log('CLIENT CONNECT: contact saved, selected');
+    } catch (e, st) {
+      _log('CLIENT CONNECT FAILED: $e');
+      _log('$st');
       setState(() => _status = 'Connection failed: $e');
     }
   }
@@ -471,6 +558,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _handleIncomingMessage(String text, {required bool fromHost}) {
     final senderId = fromHost ? 'host' : 'client';
+    _log('INCOMING MSG from $senderId: "$text"');
     final msg = ChatMessage(
       id: const Uuid().v4(),
       contactId: senderId,
@@ -485,6 +573,8 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _sendMessage() async {
     final text = _textController.text.trim();
     if (text.isEmpty) return;
+
+    _log('SEND: preparing "$text"');
 
     final msg = ChatMessage(
       id: const Uuid().v4(),
@@ -501,12 +591,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       if (_role == P2pRole.host) {
+        _log('SEND: host broadcasting to ${_groupClients.length} clients...');
         await _host.broadcastText(text);
+        _log('SEND: host broadcastText returned SUCCESS');
       } else if (_role == P2pRole.client) {
+        _log('SEND: client broadcasting...');
         await _client.broadcastText(text);
+        _log('SEND: client broadcastText returned SUCCESS');
       }
-    } catch (e) {
-      debugPrint('SEND ERROR: $e');
+    } catch (e, st) {
+      _log('SEND FAILED: $e');
+      _log('$st');
       setState(() => _status = 'Send failed: $e');
     }
   }
@@ -578,6 +673,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _disconnect() async {
+    _log('DISCONNECT: role=$_role');
     if (_role == P2pRole.host) {
       await _host.removeGroup();
     } else if (_role == P2pRole.client) {
@@ -591,6 +687,79 @@ class _HomeScreenState extends State<HomeScreen> {
       _selectedContact = null;
       _status = 'Disconnected';
     });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  DEBUG UI
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  void _showDebugConsole() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.black,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.7,
+        minChildSize: 0.3,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (_, scrollCtrl) => Container(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.bug_report, color: Colors.orange),
+                  const SizedBox(width: 8),
+                  const Text('Debug Console', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.copy, color: Colors.green),
+                    tooltip: 'Copy all logs',
+                    onPressed: () {
+                      final all = _debugLogs.join('\n');
+                      Clipboard.setData(ClipboardData(text: all));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('All logs copied to clipboard!')),
+                      );
+                    },
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.clear_all, color: Colors.red),
+                    tooltip: 'Clear logs',
+                    onPressed: () => setState(() => _debugLogs.clear()),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => Navigator.pop(ctx),
+                  ),
+                ],
+              ),
+              const Divider(color: Colors.grey),
+              Expanded(
+                child: _debugLogs.isEmpty
+                    ? const Center(child: Text('No logs yet...', style: TextStyle(color: Colors.grey)))
+                    : ListView.builder(
+                        controller: scrollCtrl,
+                        itemCount: _debugLogs.length,
+                        itemBuilder: (_, i) {
+                          final line = _debugLogs[i];
+                          Color color = Colors.white70;
+                          if (line.contains('FAILED') || line.contains('ERROR')) color = Colors.red;
+                          else if (line.contains('SUCCESS')) color = Colors.green;
+                          else if (line.contains('RECEIVED')) color = Colors.cyan;
+                          return SelectableText(
+                            line,
+                            style: TextStyle(fontSize: 11, color: color, fontFamily: 'monospace'),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -730,7 +899,6 @@ class _HomeScreenState extends State<HomeScreen> {
       itemCount: _discoveredHosts.length,
       itemBuilder: (_, i) {
         final h = _discoveredHosts[i];
-        // ✅ Safe field extraction — plugin docs lie about field names
         final name = h?.deviceName?.toString() ?? h?.name?.toString() ?? 'Unknown Host';
         final address = h?.deviceAddress?.toString() ?? h?.macAddress?.toString() ?? h?.id?.toString() ?? '';
         return ListTile(
@@ -815,6 +983,11 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: Text(_selectedContact?.displayName ?? 'Wi-Fi Direct'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.bug_report, color: Colors.orange),
+            tooltip: 'Debug Console',
+            onPressed: _showDebugConsole,
+          ),
           if (_isConnected)
             IconButton(
               icon: Icon(_isInCall ? Icons.call_end : Icons.call),
@@ -829,7 +1002,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       body: Column(
         children: [
-          // ── Status Bar ─────────────────────────────────────────────────────
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             color: Colors.black26,
@@ -852,8 +1024,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-
-          // ── Main Content ────────────────────────────────────────────────────
           Expanded(
             child: _role == P2pRole.none
                 ? _buildRoleSelection()
@@ -885,6 +1055,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _client.dispose();
     _audioRecorder.closeRecorder();
     _textController.dispose();
+    _debugScrollCtrl.dispose();
     super.dispose();
   }
 }
