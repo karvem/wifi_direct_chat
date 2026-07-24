@@ -323,7 +323,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _startAsServer() async {
     // ✅ Named parameter, not positional
-    await WifiDirectPlugin.startAsServer(deviceName: 'Server_$_myDeviceId');
+    await WifiDirectPlugin.startAsServer('Server_$_myDeviceId');
     await WifiDirectPlugin.startDiscovery();
     setState(() {
       _isServer = true;
