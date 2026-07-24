@@ -269,7 +269,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Contact> _contacts = [];
   List<ChatMessage> _messages = [];
-  List<BleDiscoveredDevice> _discoveredHosts = [];
+  List<dynamic> _discoveredHosts = []; // ✅ dynamic — BleDiscoveredDevice fields vary
   List<P2pClientInfo> _groupClients = []; // host only: who joined
   Contact? _selectedContact;
 
@@ -443,15 +443,18 @@ class _HomeScreenState extends State<HomeScreen> {
   //  CONNECTION (Client → Host)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  Future<void> _connectToHost(BleDiscoveredDevice device) async {
-    setState(() => _status = 'Connecting to ${device.name}...');
+  Future<void> _connectToHost(dynamic device) async {
+    // ✅ dynamic with safe field extraction — plugin docs lie about field names
+    final name = device.deviceName?.toString() ?? device.name?.toString() ?? 'Unknown Host';
+    final address = device.deviceAddress?.toString() ?? device.macAddress?.toString() ?? device.id?.toString() ?? '';
+
+    setState(() => _status = 'Connecting to $name...');
     try {
       await _client.connectWithDevice(device);
-      // Create contact for this host
       final contact = Contact(
-        uniqueId: device.macAddress ?? const Uuid().v4(),
-        displayName: device.name ?? 'Host',
-        deviceAddress: device.macAddress,
+        uniqueId: address.isNotEmpty ? address : const Uuid().v4(),
+        displayName: name,
+        deviceAddress: address,
         lastSeen: DateTime.now(),
       );
       await _contactBox.put(contact.uniqueId, contact);
@@ -467,7 +470,6 @@ class _HomeScreenState extends State<HomeScreen> {
   // ═══════════════════════════════════════════════════════════════════════════
 
   void _handleIncomingMessage(String text, {required bool fromHost}) {
-    // Determine sender id
     final senderId = fromHost ? 'host' : 'client';
     final msg = ChatMessage(
       id: const Uuid().v4(),
@@ -484,7 +486,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final text = _textController.text.trim();
     if (text.isEmpty) return;
 
-    // Add to local UI immediately
     final msg = ChatMessage(
       id: const Uuid().v4(),
       contactId: _selectedContact?.uniqueId ?? 'broadcast',
@@ -498,7 +499,6 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     _messageBox.add(msg);
 
-    // Broadcast over P2P
     try {
       if (_role == P2pRole.host) {
         await _host.broadcastText(text);
@@ -528,7 +528,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final path = await _audioRecorder.stopRecorder();
     setState(() => _isRecordingVoiceMessage = false);
     if (path != null) {
-      // For now, send a text placeholder; file transfer can be added later
       final msg = ChatMessage(
         id: const Uuid().v4(),
         contactId: _selectedContact!.uniqueId,
@@ -731,10 +730,13 @@ class _HomeScreenState extends State<HomeScreen> {
       itemCount: _discoveredHosts.length,
       itemBuilder: (_, i) {
         final h = _discoveredHosts[i];
+        // ✅ Safe field extraction — plugin docs lie about field names
+        final name = h?.deviceName?.toString() ?? h?.name?.toString() ?? 'Unknown Host';
+        final address = h?.deviceAddress?.toString() ?? h?.macAddress?.toString() ?? h?.id?.toString() ?? '';
         return ListTile(
           leading: const Icon(Icons.router),
-          title: Text(h.name ?? 'Unknown Host'),
-          subtitle: Text(h.macAddress ?? ''),
+          title: Text(name),
+          subtitle: Text(address),
           trailing: ElevatedButton(
             onPressed: () => _connectToHost(h),
             child: const Text('Connect'),
