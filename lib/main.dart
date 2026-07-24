@@ -53,7 +53,7 @@ class ChatMessage {
   @HiveField(5)
   final List<String> reactions;
   @HiveField(6)
-  final String type; // text, file, voice
+  final String type;
   @HiveField(7)
   final String? filePath;
   @HiveField(8)
@@ -223,7 +223,7 @@ class WifiDirectApp extends StatelessWidget {
   }
 }
 
-// ============ HOME SCREEN (using wifi_direct_plugin) ============
+// ============ HOME SCREEN (fixed for wifi_direct_plugin 0.1.7) ============
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
   @override
@@ -238,20 +238,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Contact> _contacts = [];
   List<ChatMessage> _messages = [];
-  List<WifiDirectDevice> _discoveredDevices = [];
+  // ✅ Use dynamic because WifiDirectDevice is not exported
+  List<dynamic> _discoveredDevices = [];
   Contact? _selectedContact;
   bool _isConnected = false;
   String _status = 'Initializing...';
   String _myDeviceId = '';
 
-  // Role selection: null = not started, true = server, false = client
   bool? _isServer;
 
-  // Voice
   final FlutterSoundRecorder _audioRecorder = FlutterSoundRecorder();
   bool _isRecordingVoiceMessage = false;
-
-  // Call state (placeholder)
   bool _isInCall = false;
 
   @override
@@ -278,19 +275,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
     await _audioRecorder.openRecorder();
 
-    // Initialize plugin
     await WifiDirectPlugin.initialize();
 
-    // Listen for peers
-    WifiDirectPlugin.peersStream.listen((List<WifiDirectDevice> peers) {
+    // ✅ Use var/dynamic for stream callbacks — types are not exported
+    WifiDirectPlugin.peersStream.listen((peers) {
       setState(() {
         _discoveredDevices = peers;
       });
     });
 
-    // Listen for connection changes
-    WifiDirectPlugin.connectionStream.listen((WifiDirectConnectionInfo info) {
-      final connected = info.isConnected;
+    WifiDirectPlugin.connectionStream.listen((info) {
+      final connected = info.isConnected as bool;
       setState(() {
         _isConnected = connected;
         _status = connected
@@ -299,7 +294,6 @@ class _HomeScreenState extends State<HomeScreen> {
       });
     });
 
-    // Handle incoming text
     WifiDirectPlugin.onTextReceived = (String text) {
       _handleIncomingMessage(text);
     };
@@ -308,33 +302,28 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _handleIncomingMessage(String text) {
-    setState(() {
-      _messages.add(ChatMessage(
-        id: const Uuid().v4(),
-        contactId: _selectedContact?.uniqueId ?? 'unknown',
-        text: text,
-        isMine: false,
-        timestamp: DateTime.now(),
-      ));
-    });
-    // Persist to Hive
-    _messageBox.add(_messages.last);
+    final msg = ChatMessage(
+      id: const Uuid().v4(),
+      contactId: _selectedContact?.uniqueId ?? 'unknown',
+      text: text,
+      isMine: false,
+      timestamp: DateTime.now(),
+    );
+    setState(() => _messages.add(msg));
+    _messageBox.add(msg);
   }
 
   void _loadContacts() {
-    setState(() {
-      _contacts = _contactBox.values.toList();
-    });
+    setState(() => _contacts = _contactBox.values.toList());
   }
 
   void _loadMessages() {
-    setState(() {
-      _messages = _messageBox.values.toList();
-    });
+    setState(() => _messages = _messageBox.values.toList());
   }
 
   Future<void> _startAsServer() async {
-    await WifiDirectPlugin.startAsServer('Server_$_myDeviceId');
+    // ✅ Named parameter, not positional
+    await WifiDirectPlugin.startAsServer(deviceName: 'Server_$_myDeviceId');
     await WifiDirectPlugin.startDiscovery();
     setState(() {
       _isServer = true;
@@ -343,7 +332,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _startAsClient() async {
-    await WifiDirectPlugin.startAsClient('Client_$_myDeviceId');
+    // ✅ Named parameter, not positional
+    await WifiDirectPlugin.startAsClient(deviceName: 'Client_$_myDeviceId');
     await WifiDirectPlugin.startDiscovery();
     setState(() {
       _isServer = false;
@@ -351,18 +341,19 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  void _connectToDevice(WifiDirectDevice device) async {
+  // ✅ dynamic type since WifiDirectDevice isn't exported
+  void _connectToDevice(dynamic device) async {
     setState(() => _status = 'Connecting...');
     final contact = Contact(
       uniqueId: const Uuid().v4(),
-      displayName: device.deviceName,
-      deviceAddress: device.deviceAddress,
+      displayName: device.deviceName as String,
+      deviceAddress: device.deviceAddress as String,
       lastSeen: DateTime.now(),
     );
     await _contactBox.add(contact);
     _loadContacts();
     _selectedContact = contact;
-    await WifiDirectPlugin.connect(device.deviceAddress);
+    await WifiDirectPlugin.connect(device.deviceAddress as String);
   }
 
   void _sendMessage() {
@@ -465,7 +456,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       body: Column(
         children: [
-          // Status bar
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             color: Colors.black26,
@@ -480,8 +470,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-
-          // Role selection (if not started)
           if (_isServer == null)
             Padding(
               padding: const EdgeInsets.all(12.0),
@@ -501,25 +489,24 @@ class _HomeScreenState extends State<HomeScreen> {
                 ],
               ),
             ),
-
-          // Device list (if not connected)
           if (_isServer != null && !_isConnected)
             Expanded(
               child: ListView.builder(
                 itemCount: _discoveredDevices.length,
-                itemBuilder: (_, i) => ListTile(
-                  leading: const Icon(Icons.phone_android),
-                  title: Text(_discoveredDevices[i].deviceName),
-                  subtitle: Text(_discoveredDevices[i].deviceAddress),
-                  trailing: ElevatedButton(
-                    onPressed: () => _connectToDevice(_discoveredDevices[i]),
-                    child: const Text('Connect'),
-                  ),
-                ),
+                itemBuilder: (_, i) {
+                  final device = _discoveredDevices[i];
+                  return ListTile(
+                    leading: const Icon(Icons.phone_android),
+                    title: Text(device.deviceName ?? 'Unknown'),
+                    subtitle: Text(device.deviceAddress ?? ''),
+                    trailing: ElevatedButton(
+                      onPressed: () => _connectToDevice(device),
+                      child: const Text('Connect'),
+                    ),
+                  );
+                },
               ),
             ),
-
-          // Chat messages
           if (_isConnected && _selectedContact != null)
             Expanded(
               child: ListView.builder(
@@ -537,8 +524,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 },
               ),
             ),
-
-          // Input row
           if (_isConnected && _selectedContact != null)
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -551,8 +536,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
-                        color:
-                            _isRecordingVoiceMessage ? Colors.red : Colors.grey,
+                        color: _isRecordingVoiceMessage ? Colors.red : Colors.grey,
                         shape: BoxShape.circle,
                       ),
                       child: Icon(
