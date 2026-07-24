@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:wifi_direct/wifi_direct.dart';          // ✅ new import
+import 'package:wifi_direct_plugin/wifi_direct_plugin.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -76,7 +76,6 @@ class ChatMessage {
 }
 
 // ============ HIVE ADAPTERS (unchanged) ============
-@HiveType(typeId: 0)
 class ContactAdapter extends TypeAdapter<Contact> {
   @override
   final int typeId = 0;
@@ -102,7 +101,6 @@ class ContactAdapter extends TypeAdapter<Contact> {
   }
 }
 
-@HiveType(typeId: 1)
 class ChatMessageAdapter extends TypeAdapter<ChatMessage> {
   @override
   final int typeId = 1;
@@ -136,7 +134,7 @@ class ChatMessageAdapter extends TypeAdapter<ChatMessage> {
   }
 }
 
-// ============ ENCRYPTION (fixed record access) ============
+// ============ ENCRYPTION (unchanged) ============
 class EncryptionService {
   static final _storage = FlutterSecureStorage();
   static const String _myPrivateKeyKey = 'my_rsa_private_key';
@@ -157,7 +155,6 @@ class EncryptionService {
     if (privateKey == null) {
       await Encryptify.generateKeys();
       final keys = await Encryptify.returnKeys();
-      // ✅ Record fields, not map keys
       await _storage.write(key: _myPublicKeyKey, value: keys.rsaPublicKey);
       await _storage.write(key: _myPrivateKeyKey, value: keys.rsaPrivateKey);
     }
@@ -179,7 +176,6 @@ class EncryptionService {
       message: plaintext,
       recipientRSAPublicKey: recipientPublicKey,
     );
-    // ✅ Record fields
     return {
       'encryptedMessage': result.encryptedMessage,
       'encryptedAESKey': result.encryptedAesKey,
@@ -227,7 +223,7 @@ class WifiDirectApp extends StatelessWidget {
   }
 }
 
-// ============ HOME SCREEN (using wifi_direct package) ============
+// ============ HOME SCREEN (using wifi_direct_plugin) ============
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
   @override
@@ -235,8 +231,6 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  // ✅ WiFiDirect.instance is a singleton; no separate init needed.
-  final WiFiDirect _wifiDirect = WiFiDirect.instance;
   final TextEditingController _textController = TextEditingController();
 
   late Box<Contact> _contactBox;
@@ -244,12 +238,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Contact> _contacts = [];
   List<ChatMessage> _messages = [];
-  // ✅ DiscoveredPeer is the type from the wifi_direct package
-  List<DiscoveredPeer> _discoveredDevices = [];
+  List<WifiDirectDevice> _discoveredDevices = [];
   Contact? _selectedContact;
   bool _isConnected = false;
   String _status = 'Initializing...';
   String _myDeviceId = '';
+
+  // Role selection: null = not started, true = server, false = client
+  bool? _isServer;
 
   // Voice
   final FlutterSoundRecorder _audioRecorder = FlutterSoundRecorder();
@@ -279,44 +275,50 @@ class _HomeScreenState extends State<HomeScreen> {
 
     _myDeviceId = await EncryptionService.getMyDeviceId();
     await EncryptionService.ensureKeys();
-    setState(() => _status = 'Device ID: $_myDeviceId');
 
     await _audioRecorder.openRecorder();
 
-    // ✅ Wi-Fi Direct initialization is automatic; start peer discovery.
-    _wifiDirect.startPeerDiscovery();
+    // Initialize plugin
+    await WifiDirectPlugin.initialize();
 
-    // Listen for discovered peers
-    _wifiDirect.onPeersChanged.listen((List<DiscoveredPeer> peers) {
+    // Listen for peers
+    WifiDirectPlugin.peersStream.listen((List<WifiDirectDevice> peers) {
       setState(() {
         _discoveredDevices = peers;
       });
     });
 
-    // Listen for incoming data (messages)
-    _wifiDirect.onDataReceived.listen((DataReceivedEvent event) {
-      final message = event.data; // depending on the plugin, may be string or bytes
-      setState(() {
-        _messages.add(ChatMessage(
-          id: const Uuid().v4(),
-          contactId: _selectedContact?.uniqueId ?? 'unknown',
-          text: message is String ? message : 'Binary data',
-          isMine: false,
-          timestamp: DateTime.now(),
-        ));
-      });
-    });
-
-    // Listen for connection state changes
-    _wifiDirect.onConnectionStateChanged.listen((ConnectionState state) {
-      final connected = state == ConnectionState.connected;
+    // Listen for connection changes
+    WifiDirectPlugin.connectionStream.listen((WifiDirectConnectionInfo info) {
+      final connected = info.isConnected;
       setState(() {
         _isConnected = connected;
         _status = connected
             ? 'Connected to ${_selectedContact?.displayName ?? 'peer'}'
-            : 'Disconnected';
+            : 'Disconnected / Ready';
       });
     });
+
+    // Handle incoming text
+    WifiDirectPlugin.onTextReceived = (String text) {
+      _handleIncomingMessage(text);
+    };
+
+    setState(() => _status = 'Device ID: $_myDeviceId — Choose Server or Client');
+  }
+
+  void _handleIncomingMessage(String text) {
+    setState(() {
+      _messages.add(ChatMessage(
+        id: const Uuid().v4(),
+        contactId: _selectedContact?.uniqueId ?? 'unknown',
+        text: text,
+        isMine: false,
+        timestamp: DateTime.now(),
+      ));
+    });
+    // Persist to Hive
+    _messageBox.add(_messages.last);
   }
 
   void _loadContacts() {
@@ -331,35 +333,54 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  void _connectToDevice(DiscoveredPeer device) async {
+  Future<void> _startAsServer() async {
+    await WifiDirectPlugin.startAsServer('Server_$_myDeviceId');
+    await WifiDirectPlugin.startDiscovery();
+    setState(() {
+      _isServer = true;
+      _status = 'Running as Server...';
+    });
+  }
+
+  Future<void> _startAsClient() async {
+    await WifiDirectPlugin.startAsClient('Client_$_myDeviceId');
+    await WifiDirectPlugin.startDiscovery();
+    setState(() {
+      _isServer = false;
+      _status = 'Running as Client...';
+    });
+  }
+
+  void _connectToDevice(WifiDirectDevice device) async {
     setState(() => _status = 'Connecting...');
-    // Create a contact from the discovered peer
     final contact = Contact(
       uniqueId: const Uuid().v4(),
-      displayName: device.name,        // ✅ name property
-      deviceAddress: device.address,   // ✅ address property
+      displayName: device.deviceName,
+      deviceAddress: device.deviceAddress,
       lastSeen: DateTime.now(),
     );
     await _contactBox.add(contact);
     _loadContacts();
     _selectedContact = contact;
-    await _wifiDirect.connect(device); // ✅ connect method
+    await WifiDirectPlugin.connect(device.deviceAddress);
   }
 
   void _sendMessage() {
     if (_textController.text.isEmpty || _selectedContact == null) return;
     final text = _textController.text;
-    _wifiDirect.sendMessage(text);      // ✅ sendMessage still exists
+    WifiDirectPlugin.sendText(text);
+    final msg = ChatMessage(
+      id: const Uuid().v4(),
+      contactId: _selectedContact!.uniqueId,
+      text: text,
+      isMine: true,
+      timestamp: DateTime.now(),
+    );
     setState(() {
-      _messages.add(ChatMessage(
-        id: const Uuid().v4(),
-        contactId: _selectedContact!.uniqueId,
-        text: text,
-        isMine: true,
-        timestamp: DateTime.now(),
-      ));
+      _messages.add(msg);
       _textController.clear();
     });
+    _messageBox.add(msg);
   }
 
   void _startRecordingVoiceMessage() async {
@@ -375,17 +396,17 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!_isRecordingVoiceMessage) return;
     final path = await _audioRecorder.stopRecorder();
     if (path != null) {
-      _wifiDirect.sendMessage('Voice message sent');
-      setState(() {
-        _messages.add(ChatMessage(
-          id: const Uuid().v4(),
-          contactId: _selectedContact!.uniqueId,
-          text: '🎤 Voice message sent',
-          isMine: true,
-          timestamp: DateTime.now(),
-          type: 'voice',
-        ));
-      });
+      WifiDirectPlugin.sendText('Voice message sent');
+      final msg = ChatMessage(
+        id: const Uuid().v4(),
+        contactId: _selectedContact!.uniqueId,
+        text: '🎤 Voice message sent',
+        isMine: true,
+        timestamp: DateTime.now(),
+        type: 'voice',
+      );
+      setState(() => _messages.add(msg));
+      _messageBox.add(msg);
     }
     setState(() => _isRecordingVoiceMessage = false);
   }
@@ -436,8 +457,9 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.refresh),
-            // ✅ restart peer discovery
-            onPressed: () => _wifiDirect.startPeerDiscovery(),
+            onPressed: () {
+              if (_isServer != null) WifiDirectPlugin.startDiscovery();
+            },
           ),
         ],
       ),
@@ -458,15 +480,37 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
+
+          // Role selection (if not started)
+          if (_isServer == null)
+            Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: _startAsServer,
+                    icon: const Icon(Icons.cloud_upload),
+                    label: const Text('Start as Server'),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: _startAsClient,
+                    icon: const Icon(Icons.cloud_download),
+                    label: const Text('Start as Client'),
+                  ),
+                ],
+              ),
+            ),
+
           // Device list (if not connected)
-          if (!_isConnected)
+          if (_isServer != null && !_isConnected)
             Expanded(
               child: ListView.builder(
                 itemCount: _discoveredDevices.length,
                 itemBuilder: (_, i) => ListTile(
                   leading: const Icon(Icons.phone_android),
-                  title: Text(_discoveredDevices[i].name),
-                  subtitle: Text(_discoveredDevices[i].address),
+                  title: Text(_discoveredDevices[i].deviceName),
+                  subtitle: Text(_discoveredDevices[i].deviceAddress),
                   trailing: ElevatedButton(
                     onPressed: () => _connectToDevice(_discoveredDevices[i]),
                     child: const Text('Connect'),
@@ -474,6 +518,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
+
           // Chat messages
           if (_isConnected && _selectedContact != null)
             Expanded(
@@ -492,6 +537,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 },
               ),
             ),
+
           // Input row
           if (_isConnected && _selectedContact != null)
             Container(
@@ -542,7 +588,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    _wifiDirect.stopPeerDiscovery();   // ✅ clean up discovery
+    WifiDirectPlugin.cleanup();
     _audioRecorder.closeRecorder();
     super.dispose();
   }
