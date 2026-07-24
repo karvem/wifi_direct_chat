@@ -16,10 +16,10 @@ subprojects {
     project.layout.buildDirectory.value(newSubprojectBuildDir)
     project.evaluationDependsOn(":app")
 
-    // ✅ Force every plugin to compile against API 36
     afterEvaluate {
-        extensions.findByType<com.android.build.gradle.BaseExtension>()?.apply {
-            compileSdkVersion = 36
+        // ✅ Force compileSdk 36 on all Android modules (plugins + app)
+        extensions.findByType<com.android.build.api.dsl.CommonExtension<*, *, *, *, *, *>>()?.apply {
+            compileSdk = 36
         }
     }
 }
