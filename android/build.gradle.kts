@@ -14,12 +14,19 @@ rootProject.layout.buildDirectory.value(newBuildDir)
 subprojects {
     val newSubprojectBuildDir: Directory = newBuildDir.dir(project.name)
     project.layout.buildDirectory.value(newSubprojectBuildDir)
+}
+subprojects {
     project.evaluationDependsOn(":app")
+}
 
+// ✅ Separate block: force compileSdk 36 on every Android module
+subprojects {
     afterEvaluate {
-        @Suppress("DEPRECATION")
-        extensions.findByType<com.android.build.gradle.BaseExtension>()?.apply {
-            compileSdkVersion(36)   // ✅ method call, not property assignment
+        extensions.findByName("android")?.let { androidExt ->
+            @Suppress("DEPRECATION")
+            if (androidExt is com.android.build.gradle.BaseExtension) {
+                androidExt.compileSdkVersion(36)
+            }
         }
     }
 }
