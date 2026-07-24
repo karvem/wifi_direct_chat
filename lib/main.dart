@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:wifi_direct_plugin/wifi_direct_plugin.dart';
+import 'package:wifi_direct/wifi_direct.dart';          // ✅ new import
 import 'package:permission_handler/permission_handler.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -12,7 +12,7 @@ import 'package:uuid/uuid.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 
-// ============ MODELS ============
+// ============ MODELS (unchanged) ============
 @HiveType(typeId: 0)
 class Contact {
   @HiveField(0)
@@ -75,7 +75,7 @@ class ChatMessage {
   });
 }
 
-// ============ HIVE ADAPTERS ============
+// ============ HIVE ADAPTERS (unchanged) ============
 @HiveType(typeId: 0)
 class ContactAdapter extends TypeAdapter<Contact> {
   @override
@@ -136,7 +136,7 @@ class ChatMessageAdapter extends TypeAdapter<ChatMessage> {
   }
 }
 
-// ============ ENCRYPTION ============
+// ============ ENCRYPTION (fixed record access) ============
 class EncryptionService {
   static final _storage = FlutterSecureStorage();
   static const String _myPrivateKeyKey = 'my_rsa_private_key';
@@ -155,12 +155,11 @@ class EncryptionService {
   static Future<void> ensureKeys() async {
     String? privateKey = await _storage.read(key: _myPrivateKeyKey);
     if (privateKey == null) {
-      // Encryptify.generateKeys() returns a map with keys 'publicKey' and 'privateKey'
       await Encryptify.generateKeys();
-      // The returnKeys() method returns a map with 'publicKey' and 'privateKey'
       final keys = await Encryptify.returnKeys();
-      await _storage.write(key: _myPublicKeyKey, value: keys['publicKey'] as String);
-      await _storage.write(key: _myPrivateKeyKey, value: keys['privateKey'] as String);
+      // ✅ Record fields, not map keys
+      await _storage.write(key: _myPublicKeyKey, value: keys.rsaPublicKey);
+      await _storage.write(key: _myPrivateKeyKey, value: keys.rsaPrivateKey);
     }
   }
 
@@ -180,11 +179,11 @@ class EncryptionService {
       message: plaintext,
       recipientRSAPublicKey: recipientPublicKey,
     );
-    // result is a map with keys: 'encryptedMessage', 'encryptedAESKey', 'encryptedIV'
+    // ✅ Record fields
     return {
-      'encryptedMessage': result['encryptedMessage'] as String,
-      'encryptedAESKey': result['encryptedAESKey'] as String,
-      'encryptedIV': result['encryptedIV'] as String,
+      'encryptedMessage': result.encryptedMessage,
+      'encryptedAESKey': result.encryptedAesKey,
+      'encryptedIV': result.encryptedIV,
     };
   }
 
@@ -195,7 +194,6 @@ class EncryptionService {
   ) async {
     final privateKey = await getMyPrivateKey();
     if (privateKey == null) throw Exception('No private key');
-    // decryptMessage expects 5 parameters
     return await Encryptify.decryptMessage(
       currentUserID: await getMyDeviceId(),
       senderID: 'sender',
@@ -229,7 +227,7 @@ class WifiDirectApp extends StatelessWidget {
   }
 }
 
-// ============ HOME SCREEN ============
+// ============ HOME SCREEN (using wifi_direct package) ============
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
   @override
@@ -237,7 +235,8 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final WifiDirectPlugin _wifiDirect = WifiDirectPlugin();
+  // ✅ WiFiDirect.instance is a singleton; no separate init needed.
+  final WiFiDirect _wifiDirect = WiFiDirect.instance;
   final TextEditingController _textController = TextEditingController();
 
   late Box<Contact> _contactBox;
@@ -245,7 +244,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Contact> _contacts = [];
   List<ChatMessage> _messages = [];
-  List<WifiDirectDevice> _discoveredDevices = [];
+  // ✅ DiscoveredPeer is the type from the wifi_direct package
+  List<DiscoveredPeer> _discoveredDevices = [];
   Contact? _selectedContact;
   bool _isConnected = false;
   String _status = 'Initializing...';
@@ -283,41 +283,40 @@ class _HomeScreenState extends State<HomeScreen> {
 
     await _audioRecorder.openRecorder();
 
-    // Initialize the Wi-Fi Direct plugin
-    await _wifiDirect.init();
+    // ✅ Wi-Fi Direct initialization is automatic; start peer discovery.
+    _wifiDirect.startPeerDiscovery();
 
-    // Listen for devices found
-    _wifiDirect.onDeviceFound.listen((device) {
+    // Listen for discovered peers
+    _wifiDirect.onPeersChanged.listen((List<DiscoveredPeer> peers) {
       setState(() {
-        if (!_discoveredDevices.contains(device)) {
-          _discoveredDevices.add(device);
-        }
+        _discoveredDevices = peers;
       });
     });
 
-    // Listen for incoming messages
-    _wifiDirect.onMessageReceived.listen((message) {
+    // Listen for incoming data (messages)
+    _wifiDirect.onDataReceived.listen((DataReceivedEvent event) {
+      final message = event.data; // depending on the plugin, may be string or bytes
       setState(() {
         _messages.add(ChatMessage(
           id: const Uuid().v4(),
           contactId: _selectedContact?.uniqueId ?? 'unknown',
-          text: message,
+          text: message is String ? message : 'Binary data',
           isMine: false,
           timestamp: DateTime.now(),
         ));
       });
     });
 
-    // Listen for connection changes
-    _wifiDirect.onConnectionChanged.listen((status) {
+    // Listen for connection state changes
+    _wifiDirect.onConnectionStateChanged.listen((ConnectionState state) {
+      final connected = state == ConnectionState.connected;
       setState(() {
-        _isConnected = (status == 'connected');
-        _status = _isConnected ? 'Connected to ${_selectedContact?.displayName ?? 'peer'}' : 'Disconnected';
+        _isConnected = connected;
+        _status = connected
+            ? 'Connected to ${_selectedContact?.displayName ?? 'peer'}'
+            : 'Disconnected';
       });
     });
-
-    // Start discovering devices
-    _wifiDirect.discoverDevices();
   }
 
   void _loadContacts() {
@@ -332,25 +331,25 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  void _connectToDevice(WifiDirectDevice device) async {
+  void _connectToDevice(DiscoveredPeer device) async {
     setState(() => _status = 'Connecting...');
-    // For demo, create a contact
+    // Create a contact from the discovered peer
     final contact = Contact(
       uniqueId: const Uuid().v4(),
-      displayName: device.deviceName,
-      deviceAddress: device.address,
+      displayName: device.name,        // ✅ name property
+      deviceAddress: device.address,   // ✅ address property
       lastSeen: DateTime.now(),
     );
     await _contactBox.add(contact);
     _loadContacts();
     _selectedContact = contact;
-    _wifiDirect.connectToDevice(device);
+    await _wifiDirect.connect(device); // ✅ connect method
   }
 
   void _sendMessage() {
     if (_textController.text.isEmpty || _selectedContact == null) return;
     final text = _textController.text;
-    _wifiDirect.sendMessage(text);
+    _wifiDirect.sendMessage(text);      // ✅ sendMessage still exists
     setState(() {
       _messages.add(ChatMessage(
         id: const Uuid().v4(),
@@ -366,7 +365,8 @@ class _HomeScreenState extends State<HomeScreen> {
   void _startRecordingVoiceMessage() async {
     if (_selectedContact == null) return;
     final tempDir = await getTemporaryDirectory();
-    final path = '${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.aac';
+    final path =
+        '${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.aac';
     await _audioRecorder.startRecorder(toFile: path, codec: Codec.aacADTS);
     setState(() => _isRecordingVoiceMessage = true);
   }
@@ -390,11 +390,12 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _isRecordingVoiceMessage = false);
   }
 
-  // Placeholder call
   void _toggleCall() {
     setState(() {
       _isInCall = !_isInCall;
-      _status = _isInCall ? 'In call with ${_selectedContact?.displayName}' : 'Call ended';
+      _status = _isInCall
+          ? 'In call with ${_selectedContact?.displayName}'
+          : 'Call ended';
     });
   }
 
@@ -435,7 +436,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: () => _wifiDirect.discoverDevices(),
+            // ✅ restart peer discovery
+            onPressed: () => _wifiDirect.startPeerDiscovery(),
           ),
         ],
       ),
@@ -447,7 +449,8 @@ class _HomeScreenState extends State<HomeScreen> {
             color: Colors.black26,
             child: Row(
               children: [
-                Icon(Icons.wifi, color: _isConnected ? Colors.green : Colors.red),
+                Icon(Icons.wifi,
+                    color: _isConnected ? Colors.green : Colors.red),
                 const SizedBox(width: 8),
                 Expanded(child: Text(_status)),
                 if (_isInCall)
@@ -462,7 +465,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 itemCount: _discoveredDevices.length,
                 itemBuilder: (_, i) => ListTile(
                   leading: const Icon(Icons.phone_android),
-                  title: Text(_discoveredDevices[i].deviceName),
+                  title: Text(_discoveredDevices[i].name),
                   subtitle: Text(_discoveredDevices[i].address),
                   trailing: ElevatedButton(
                     onPressed: () => _connectToDevice(_discoveredDevices[i]),
@@ -477,9 +480,13 @@ class _HomeScreenState extends State<HomeScreen> {
               child: ListView.builder(
                 reverse: true,
                 padding: const EdgeInsets.all(12),
-                itemCount: _messages.where((m) => m.contactId == _selectedContact!.uniqueId).length,
+                itemCount: _messages
+                    .where((m) => m.contactId == _selectedContact!.uniqueId)
+                    .length,
                 itemBuilder: (_, i) {
-                  final filtered = _messages.where((m) => m.contactId == _selectedContact!.uniqueId).toList();
+                  final filtered = _messages
+                      .where((m) => m.contactId == _selectedContact!.uniqueId)
+                      .toList();
                   final msg = filtered[filtered.length - 1 - i];
                   return _buildMessageBubble(msg);
                 },
@@ -492,14 +499,14 @@ class _HomeScreenState extends State<HomeScreen> {
               color: Colors.black54,
               child: Row(
                 children: [
-                  // Voice message button (hold to record)
                   GestureDetector(
                     onLongPressStart: (_) => _startRecordingVoiceMessage(),
                     onLongPressEnd: (_) => _stopRecordingAndSendVoiceMessage(),
                     child: Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
-                        color: _isRecordingVoiceMessage ? Colors.red : Colors.grey,
+                        color:
+                            _isRecordingVoiceMessage ? Colors.red : Colors.grey,
                         shape: BoxShape.circle,
                       ),
                       child: Icon(
@@ -535,6 +542,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _wifiDirect.stopPeerDiscovery();   // ✅ clean up discovery
     _audioRecorder.closeRecorder();
     super.dispose();
   }
