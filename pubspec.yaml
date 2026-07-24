@@ -1,61 +1,34 @@
-name: wifi_direct_app
-description: A Wi‑Fi Direct app with voice, chat, file sharing, and encryption.
-publish_to: 'none'
+name: wifi_direct_chat
+description: A Wi-Fi Direct chat app
 version: 1.0.0+1
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: ">=3.7.0 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
 
-  # Core Wi‑Fi Direct & Networking
   wifi_direct_plugin: ^0.1.7
-
-  # UI – Liquid Glass Effect (iOS style)
   cupertino_liquid_glass: ^0.6.0
-
-  # Message Reactions
   nex_chat_reaction: ^0.1.4
-
-  # Permissions – we use the latest, but override below
   permission_handler: ^12.0.1
-
-  # File Picker & Storage – updated to match wifi_direct_plugin
   file_picker: ^10.2.0
   path_provider: ^2.1.0
-
-  # Encryption – correct version is 0.0.4 (not 1.0.0)
   encryptify: ^0.0.4
   flutter_secure_storage: ^9.0.0
-
-  # Local Database
   hive: ^2.2.0
   hive_flutter: ^1.1.0
-
-  # Unique ID generation
   uuid: ^4.0.0
-
-  # Real‑time Voice Call
-  flutter_local_walkie_talkie: ^1.0.0
-
-  # Voice Messages (recording & playback)
   flutter_sound: ^9.2.13
-
-  # Device info – updated to match wifi_direct_plugin
   device_info_plus: ^11.5.0
-
-# ===== OVERRIDE to fix permission_handler conflict =====
-# wifi_direct_plugin wants ^12.0.1, flutter_local_walkie_talkie wants ^11.3.1.
-# Forcing 12.0.1 works because the API is compatible.
-dependency_overrides:
-  permission_handler: 12.0.1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  hive_generator: ^2.0.0
+  build_runner: ^2.4.0
 
 flutter:
   uses-material-design: true
