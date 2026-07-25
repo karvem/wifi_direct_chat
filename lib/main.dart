@@ -15,6 +15,11 @@ import 'package:uuid/uuid.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:file_picker/file_picker.dart';
 
+// NEW IMPORTS for file interactions
+import 'package:open_file/open_file.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:cross_file/cross_file.dart'; // for XFile
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MODELS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1335,6 +1340,134 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  //  FILE INTERACTIONS (NEW)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Future<void> _handleFileTap(ChatMessage msg) async {
+    if (msg.filePath == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('File not found locally.')),
+      );
+      return;
+    }
+
+    final file = File(msg.filePath!);
+    if (!await file.exists()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('The file is no longer available.')),
+      );
+      return;
+    }
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => GlassPanel(
+        borderRadius: BorderRadius.circular(24),
+        isDark: _isDark,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                msg.fileName ?? 'File',
+                style: TextStyle(color: _fg, fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+              const SizedBox(height: 12),
+              if (_isImageFile(msg.filePath!))
+                ListTile(
+                  leading: const Icon(Icons.image),
+                  title: const Text('Preview image'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _showImagePreview(msg.filePath!);
+                  },
+                ),
+              ListTile(
+                leading: const Icon(Icons.open_in_browser),
+                title: const Text('Open with default app'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  final result = await OpenFile.open(msg.filePath!);
+                  if (result.type != ResultType.done) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Could not open file: ${result.message}')),
+                    );
+                  }
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.share),
+                title: const Text('Share'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await Share.shareXFiles([XFile(msg.filePath!)],
+                      text: 'Shared file: ${msg.fileName ?? 'file'}');
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.save_alt),
+                title: const Text('Save to Downloads'),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  await _saveFileToDownloads(msg);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _saveFileToDownloads(ChatMessage msg) async {
+    try {
+      final file = File(msg.filePath!);
+      if (!await file.exists()) throw Exception('File not found');
+      // Use share_plus to open system share/save dialog
+      await Share.shareXFiles(
+        [XFile(msg.filePath!)],
+        text: 'Save file: ${msg.fileName ?? 'file'}',
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Choose a save location in the share sheet.')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Save failed: $e')),
+      );
+    }
+  }
+
+  bool _isImageFile(String path) {
+    final ext = path.split('.').last.toLowerCase();
+    return ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].contains(ext);
+  }
+
+  void _showImagePreview(String path) {
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: GestureDetector(
+          onTap: () => Navigator.pop(ctx),
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(16),
+              image: DecorationImage(
+                image: FileImage(File(path)),
+                fit: BoxFit.contain,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   //  LIVE VOICE CALLS — real-time, direct UDP over the Wi-Fi Direct LAN.
   //  Text envelopes (call_invite/accept/reject/end/force_start) only carry
   //  signaling; the actual audio never touches the plugin at all — it's a
@@ -1481,7 +1614,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-    Future<void> _startRealtimeAudio() async {
+  Future<void> _startRealtimeAudio() async {
     final targetIp = _callPeer?.deviceAddress;
     if (targetIp == null) {
       _endCall(reason: "Missing peer network address — can't start audio");
@@ -1499,19 +1632,17 @@ class _HomeScreenState extends State<HomeScreen> {
       if (event != RawSocketEvent.read) return;
       final dg = _callSocket!.receive();
       if (dg != null && dg.data.isNotEmpty) {
-        // FIX #1: foodSink → uint8ListSink, no FoodData wrapper
         _callPlayer.uint8ListSink?.add(dg.data);
       }
     });
 
     try {
-      // FIX #2: add required bufferSize parameter
       await _callPlayer.startPlayerFromStream(
         codec: Codec.pcm16,
         numChannels: _callQuality.numChannels,
         sampleRate: _callQuality.sampleRate,
         bufferSize: 8192,
-        interleaved: true,
+        interleaved: true,  // REQUIRED
       );
     } catch (e) {
       debugPrint('CALL PLAYER START ERROR: $e — retrying at safe mono 16kHz');
@@ -1521,7 +1652,7 @@ class _HomeScreenState extends State<HomeScreen> {
           numChannels: 1,
           sampleRate: 16000,
           bufferSize: 8192,
-          interleaved: true,
+          interleaved: true,  // REQUIRED
         );
       } catch (e2) {
         _endCall(reason: 'This device could not start live call playback: $e2');
@@ -1539,8 +1670,6 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
-      // FIX #3: toStream still works but now feeds Uint8List directly (no FoodData)
-      // Also added bufferSize for recorder-to-stream (new in 9.30.0)
       await _audioRecorder.startRecorder(
         toStream: _micStreamController!.sink,
         codec: Codec.pcm16,
@@ -1563,7 +1692,6 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
   }
-
 
   Future<void> _stopRealtimeAudio() async {
     try {
@@ -2095,7 +2223,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   if (isVoice)
                     _buildVoiceRow(msg)
                   else if (isFile)
-                    _buildFileRow(msg)
+                    _buildFileRow(msg)   // NOW TAPPABLE
                   else
                     Text(msg.text, style: TextStyle(fontSize: 15, color: _fg, height: 1.3)),
                   const SizedBox(height: 6),
@@ -2144,14 +2272,24 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  // UPDATED: Tappable file row
   Widget _buildFileRow(ChatMessage msg) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(Icons.insert_drive_file_outlined, color: _fgDim, size: 22),
-        const SizedBox(width: 10),
-        Flexible(child: Text(msg.fileName ?? msg.text, style: TextStyle(color: _fg, fontSize: 13, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis)),
-      ],
+    return GestureDetector(
+      onTap: () => _handleFileTap(msg),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.insert_drive_file_outlined, color: _fgDim, size: 22),
+          const SizedBox(width: 10),
+          Flexible(
+            child: Text(
+              msg.fileName ?? msg.text,
+              style: TextStyle(color: _fg, fontSize: 13, fontWeight: FontWeight.w600),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
