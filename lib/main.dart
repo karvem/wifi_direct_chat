@@ -662,8 +662,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _playbackTimer;
   bool _isPlaying = false;
 
-  // Offline detection
+  // Offline detection – FIXED
   Timer? _heartbeatTimer;
+  Timer? _pongTimeoutTimer; // <-- NEW: tracks ping response
   bool _isPeerOnline = false;
 
   // Typing indicator
@@ -894,7 +895,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  HEARTBEAT – OFFLINE DETECTION
+  //  HEARTBEAT – OFFLINE DETECTION (FIXED)
   // ─────────────────────────────────────────────────────────────────────────────
 
   void _startHeartbeat() {
@@ -907,6 +908,8 @@ class _HomeScreenState extends State<HomeScreen> {
   void _stopHeartbeat() {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
+    _pongTimeoutTimer?.cancel(); // cancel any pending timeout
+    _pongTimeoutTimer = null;
     _isPeerOnline = false;
     _updateOfflineStatus();
   }
@@ -923,6 +926,20 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       await _sendEnvelope(env);
     } catch (_) {}
+
+    // Start a timeout to detect if pong is not received
+    _pongTimeoutTimer?.cancel();
+    _pongTimeoutTimer = Timer(const Duration(seconds: 3), () {
+      // No pong received within 3 seconds -> mark offline
+      if (_isPeerOnline) {
+        _isPeerOnline = false;
+        _updateOfflineStatus();
+        // If call is active, end it
+        if (_callPhase != CallPhase.idle) {
+          _endCall(reason: 'Peer went offline');
+        }
+      }
+    });
   }
 
   void _handlePing(Envelope env) {
@@ -937,6 +954,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _handlePong(Envelope env) {
+    // Cancel the timeout timer because we got a response
+    _pongTimeoutTimer?.cancel();
+    _pongTimeoutTimer = null;
+
     if (!_isPeerOnline) {
       _isPeerOnline = true;
       _updateOfflineStatus();
@@ -2872,6 +2893,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _callTimeoutTimer?.cancel();
     _stopRealtimeAudio();
     _heartbeatTimer?.cancel();
+    _pongTimeoutTimer?.cancel();
     _typingDebounceTimer?.cancel();
     _offlineRetryTimer?.cancel();
     _hostStateSub?.cancel();
