@@ -2102,6 +2102,20 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
+  // Converts raw little-endian PCM16 bytes (as produced by flutter_sound /
+  // received over the socket) into actual 16-bit sample values. This is
+  // required because PcmArrayInt16.fromList expects one *sample* per list
+  // entry (-32768..32767), not one raw byte per entry.
+  List<int> _bytesToInt16Samples(Uint8List bytes) {
+    final int sampleCount = bytes.length ~/ 2;
+    final byteData = ByteData.sublistView(bytes);
+    final samples = List<int>.filled(sampleCount, 0);
+    for (int i = 0; i < sampleCount; i++) {
+      samples[i] = byteData.getInt16(i * 2, Endian.little);
+    }
+    return samples;
+  }
+
   void _onPcmFeed(int remainingFrames) async {
     if (!_isPlaying || _callPhase != CallPhase.active) return;
 
@@ -2112,27 +2126,26 @@ class _HomeScreenState extends State<HomeScreen> {
       final chunk = Uint8List.fromList(_pcmFeedBuffer.sublist(0, bytesNeeded));
       _pcmFeedBuffer.removeRange(0, bytesNeeded);
       try {
-        await FlutterPcmSound.feed(PcmArrayInt16.fromList(chunk));
+        await FlutterPcmSound.feed(PcmArrayInt16.fromList(_bytesToInt16Samples(chunk)));
       } catch (e) {
         debugPrint('PCM FEED ERROR: $e');
       }
     } else if (_pcmFeedBuffer.isNotEmpty) {
       final haveBytes = _pcmFeedBuffer.length;
-      final silenceBytes = bytesNeeded - haveBytes;
       final chunk = Uint8List(bytesNeeded);
       if (haveBytes > 0) {
         chunk.setRange(0, haveBytes, Uint8List.fromList(_pcmFeedBuffer));
         _pcmFeedBuffer.clear();
       }
       try {
-        await FlutterPcmSound.feed(PcmArrayInt16.fromList(chunk));
+        await FlutterPcmSound.feed(PcmArrayInt16.fromList(_bytesToInt16Samples(chunk)));
       } catch (e) {
         debugPrint('PCM FEED ERROR: $e');
       }
     } else {
       if (bytesNeeded > 0) {
         try {
-          await FlutterPcmSound.feed(PcmArrayInt16.fromList(Uint8List(bytesNeeded)));
+          await FlutterPcmSound.feed(PcmArrayInt16.fromList(List<int>.filled(bytesNeeded ~/ 2, 0)));
         } catch (e) {
           debugPrint('PCM SILENCE FEED ERROR: $e');
         }
