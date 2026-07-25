@@ -1511,6 +1511,7 @@ class _HomeScreenState extends State<HomeScreen> {
         numChannels: _callQuality.numChannels,
         sampleRate: _callQuality.sampleRate,
         bufferSize: 8192,
+        interleaved: true,
       );
     } catch (e) {
       debugPrint('CALL PLAYER START ERROR: $e — retrying at safe mono 16kHz');
@@ -1520,6 +1521,7 @@ class _HomeScreenState extends State<HomeScreen> {
           numChannels: 1,
           sampleRate: 16000,
           bufferSize: 8192,
+          interleaved: true,
         );
       } catch (e2) {
         _endCall(reason: 'This device could not start live call playback: $e2');
