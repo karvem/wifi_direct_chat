@@ -3,6 +3,7 @@ import 'dart:collection';
 import 'dart:convert' hide Codec;
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -343,6 +344,8 @@ extension CallQualityX on CallQuality {
   int get numChannels => this == CallQuality.stereoHd ? 2 : 1;
 }
 
+enum VoiceEffect { normal, minion, slowMo }
+
 const List<List<Color>> kPalettes = [
   [Color(0xFF7C4DFF), Color(0xFF00E5FF), Color(0xFFFF4D8D)],
   [Color(0xFFFF9500), Color(0xFFFF3B30), Color(0xFFFFD60A)],
@@ -651,26 +654,28 @@ class _HomeScreenState extends State<HomeScreen> {
   Contact? _callPeer;
   String _callId = '';
   CallQuality _callQuality = CallQuality.medium;
+  CallQuality _activeCallQuality = CallQuality.medium;
+  final List<int> _audioBuffer = [];
+  bool _callPlaybackStarted = false;
   Timer? _ringTimer;
   Timer? _callTimeoutTimer;
   RawDatagramSocket? _callSocket;
   StreamSubscription? _callSocketSub;
   StreamController<Uint8List>? _micStreamController;
   StreamSubscription? _micStreamSub;
-  // Jitter buffer
-  final Queue<Uint8List> _audioQueue = Queue();
   Timer? _playbackTimer;
   bool _isPlaying = false;
 
-  // Offline detection – CONSECUTIVE FAILURES
+  // Offline detection
   Timer? _heartbeatTimer;
   int _consecutivePingFailures = 0;
-  static const int _maxPingFailures = 3; // increased tolerance
+  static const int _maxPingFailures = 3;
   bool _isPeerOnline = false;
 
   // Typing indicator
   Timer? _typingDebounceTimer;
   bool _isTyping = false;
+  VoiceEffect _voiceEffect = VoiceEffect.normal;
 
   // Pending messages (offline queue)
   final Map<String, ChatMessage> _pendingMessages = {};
@@ -889,24 +894,22 @@ class _HomeScreenState extends State<HomeScreen> {
       await _sendHello();
     }
 
-    // If this is the selected contact, start heartbeat and offline detection
     if (_selectedContact?.uniqueId == env.senderId) {
       _startHeartbeat();
     }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  HEARTBEAT – FIXED (Consecutive failures)
+  //  HEARTBEAT
   // ─────────────────────────────────────────────────────────────────────────────
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
-    _consecutivePingFailures = 0; // reset counter
+    _consecutivePingFailures = 0;
     _isPeerOnline = true;
     _updateOfflineStatus();
     _heartbeatTimer = Timer.periodic(const Duration(seconds: 5), (_) => _sendPing());
     debugPrint('Heartbeat started');
-    // send first ping immediately
     _sendPing();
   }
 
@@ -921,12 +924,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _sendPing() async {
     if (_selectedContact == null) return;
-
-    // Increment failure counter for this attempt.
     _consecutivePingFailures++;
     debugPrint('Ping attempt #$_consecutivePingFailures');
-
-    // If we've exceeded the threshold, declare offline.
     if (_consecutivePingFailures > _maxPingFailures) {
       if (_isPeerOnline) {
         _isPeerOnline = false;
@@ -936,11 +935,8 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         debugPrint('Peer marked OFFLINE after $_consecutivePingFailures failures');
       }
-      // Stop further sending for this cycle.
       return;
     }
-
-    // Send the ping
     final env = Envelope(
       type: 'ping',
       senderId: _myDeviceId,
@@ -969,12 +965,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _handlePong(Envelope env) {
-    // Reset failure counter – we got a response!
     if (_consecutivePingFailures > 0) {
       debugPrint('Pong received, resetting failure counter (was $_consecutivePingFailures)');
     }
     _consecutivePingFailures = 0;
-
     if (!_isPeerOnline) {
       _isPeerOnline = true;
       _updateOfflineStatus();
@@ -1044,7 +1038,6 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_isPeerOnline && _selectedContact != null) {
       final pending = _pendingMessages.values.toList();
       for (final msg in pending) {
-        // Re-send the message (simplified: re-use text)
         final env = Envelope(
           type: 'text',
           senderId: _myDeviceId,
@@ -1058,9 +1051,7 @@ class _HomeScreenState extends State<HomeScreen> {
           await _messageBox.put(msg.id, msg);
           _pendingMessages.remove(msg.id);
           setState(() {});
-        } catch (_) {
-          // keep pending
-        }
+        } catch (_) {}
       }
       _pulseSignal.fire();
     }
@@ -1127,9 +1118,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  TEXT MESSAGES – SEND & RECEIVE
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Future<void> _sendMessage() async {
     final text = _textController.text.trim();
@@ -1206,13 +1197,16 @@ class _HomeScreenState extends State<HomeScreen> {
       plainText = env.data['text'] as String? ?? '';
     }
 
+    // FIX: always receive as unread; let _markThreadRead handle both local state
+    // and sending the read receipt. If we set isRead=true here, _markThreadRead
+    // sees nothing to do and skips sending the receipt.
     final msg = ChatMessage(
       id: env.id,
       contactId: env.senderId,
       text: plainText,
       isMine: false,
       timestamp: DateTime.fromMillisecondsSinceEpoch(env.timestamp),
-      isRead: _selectedContact?.uniqueId == env.senderId,
+      isRead: false,
       status: 'delivered',
     );
     setState(() => _messages.add(msg));
@@ -1231,6 +1225,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await _sendEnvelope(receipt);
     } catch (_) {}
 
+    // If we are on this contact's chat screen, mark thread read (updates UI + sends read receipt)
     if (_selectedContact?.uniqueId == env.senderId) await _markThreadRead(env.senderId);
   }
 
@@ -1283,9 +1278,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (_) {}
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  REACTIONS
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   OverlayEntry? _reactionOverlay;
 
@@ -1378,15 +1373,17 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (_) {}
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  VOICE NOTES
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Future<void> _startRecordingVoiceMessage() async {
     if (_selectedContact == null || _callPhase != CallPhase.idle) return;
     final tempDir = await getTemporaryDirectory();
-    final path = '${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.aac';
-    await _audioRecorder.startRecorder(toFile: path, codec: Codec.aacADTS);
+    final ext = _voiceEffect == VoiceEffect.normal ? 'aac' : 'wav';
+    final path = '${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    final codec = _voiceEffect == VoiceEffect.normal ? Codec.aacADTS : Codec.pcm16WAV;
+    await _audioRecorder.startRecorder(toFile: path, codec: codec);
     setState(() => _isRecordingVoiceMessage = true);
   }
 
@@ -1402,22 +1399,30 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _isRecordingVoiceMessage = false);
     if (path == null || _selectedContact == null) return;
 
+    String finalPath = path;
+    if (_voiceEffect != VoiceEffect.normal) {
+      final processed = await _applyVoiceEffect(path, _voiceEffect);
+      if (processed != null) finalPath = processed;
+    }
+
     final peer = _selectedContact!;
     final msg = ChatMessage(
       id: const Uuid().v4(),
       contactId: peer.uniqueId,
-      text: '🎤 Voice message',
+      text: _voiceEffect == VoiceEffect.normal
+          ? '🎤 Voice message'
+          : (_voiceEffect == VoiceEffect.minion ? '🐿️ Minion voice' : '🐢 Slow-mo voice'),
       isMine: true,
       timestamp: DateTime.now(),
       type: 'voice',
-      filePath: path,
+      filePath: finalPath,
     );
     setState(() => _messages.add(msg));
     await _messageBox.put(msg.id, msg);
     _pulseSignal.fire();
 
     try {
-      final file = File(path);
+      final file = File(finalPath);
       final info = _role == P2pRole.host ? await _host.broadcastFile(file) : await _client.broadcastFile(file);
       if (info == null) {
         setState(() => _status = 'Voice note failed to send — check the debug console for the real exception');
@@ -1434,6 +1439,46 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (e) {
       debugPrint('VOICE SEND ERROR: $e');
       setState(() => _status = 'Voice note failed: $e');
+    }
+  }
+
+  Future<String?> _applyVoiceEffect(String wavPath, VoiceEffect effect) async {
+    try {
+      final file = File(wavPath);
+      final bytes = await file.readAsBytes();
+      if (bytes.length < 44) return null;
+
+      final bb = bytes.buffer.asByteData();
+      final originalRate = bb.getUint32(24, Endian.little);
+
+      int newRate;
+      switch (effect) {
+        case VoiceEffect.minion:
+          newRate = (originalRate * 1.8).round();
+          break;
+        case VoiceEffect.slowMo:
+          newRate = (originalRate * 0.55).round();
+          break;
+        default:
+          return wavPath;
+      }
+
+      final patched = Uint8List.fromList(bytes);
+      final pbb = patched.buffer.asByteData();
+      pbb.setUint32(24, newRate, Endian.little);
+
+      final numChannels = pbb.getUint16(22, Endian.little);
+      final bitsPerSample = pbb.getUint16(34, Endian.little);
+      final byteRate = newRate * numChannels * (bitsPerSample ~/ 8);
+      pbb.setUint32(28, byteRate, Endian.little);
+
+      final dir = await getTemporaryDirectory();
+      final outPath = '${dir.path}/voice_fx_${DateTime.now().millisecondsSinceEpoch}.wav';
+      await File(outPath).writeAsBytes(patched);
+      return outPath;
+    } catch (e) {
+      debugPrint('VOICE FX ERROR: $e');
+      return null;
     }
   }
 
@@ -1466,10 +1511,9 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
   }
-
-  // ─────────────────────────────────────────────────────────────────────────────
-  //  FILE SHARING (with progress simulation)
-  // ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+  //  FILE SHARING
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Future<void> _pickAndSendFile() async {
     if (_selectedContact == null) return;
@@ -1484,7 +1528,6 @@ class _HomeScreenState extends State<HomeScreen> {
     final peer = _selectedContact!;
     final file = File(result.files.single.path!);
     final name = result.files.single.name;
-    final size = await file.length();
 
     final msg = ChatMessage(
       id: const Uuid().v4(),
@@ -1506,7 +1549,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _fileTransferProgress[msg.id] = 0.0;
 
     try {
-      // Simulate progress (plugin doesn't expose real progress)
       int progress = 0;
       Timer.periodic(const Duration(milliseconds: 100), (timer) {
         if (cancelToken.isCancelled) {
@@ -1586,9 +1628,7 @@ class _HomeScreenState extends State<HomeScreen> {
         await _messageBox.put(msg.id, msg);
         _pendingMessages.remove(msg.id);
         setState(() {});
-      } catch (e) {
-        // keep pending
-      }
+      } catch (e) {}
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Peer is still offline.')),
@@ -1596,9 +1636,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  FILE RECEIVE
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Future<void> _handleFileNoticeEnvelope(Envelope env) async {
     final fileId = env.data['fileId'] as String?;
@@ -1639,7 +1679,7 @@ class _HomeScreenState extends State<HomeScreen> {
         type: kind == 'voice' ? 'voice' : 'file',
         filePath: savedPath,
         fileName: info.info.name,
-        isRead: _selectedContact?.uniqueId == notice.senderId,
+        isRead: false,
         status: 'delivered',
       );
       setState(() => _messages.add(msg));
@@ -1651,9 +1691,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  //  FILE INTERACTION (open/share/save/preview) – fixed backgrounds
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  FILE INTERACTION (open/share/save/preview)
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   bool _isImageFile(String path) {
     final ext = path.split('.').last.toLowerCase();
@@ -1776,9 +1816,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  LIVE VOICE CALLS (with jitter buffer)
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Future<void> _startCall(Contact peer) async {
     if (_callPhase != CallPhase.idle) return;
@@ -1796,8 +1836,19 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     _callPeer = peer;
     _callId = const Uuid().v4();
+    _activeCallQuality = _callQuality;
     setState(() => _callPhase = CallPhase.outgoingRinging);
-    final env = Envelope(type: 'call_invite', senderId: _myDeviceId, senderName: _myDisplayName, to: peer.uniqueId, data: {'callId': _callId});
+    final env = Envelope(
+      type: 'call_invite',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: peer.uniqueId,
+      data: {
+        'callId': _callId,
+        'sampleRate': _activeCallQuality.sampleRate,
+        'numChannels': _activeCallQuality.numChannels,
+      },
+    );
     try {
       await _sendEnvelope(env);
     } catch (e) {
@@ -1826,6 +1877,14 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     final contact = _contactBox.get(env.senderId);
     if (contact == null) return;
+
+    final sampleRate = env.data['sampleRate'] as int? ?? CallQuality.medium.sampleRate;
+    final numChannels = env.data['numChannels'] as int? ?? CallQuality.medium.numChannels;
+    _activeCallQuality = CallQuality.values.firstWhere(
+      (q) => q.sampleRate == sampleRate && q.numChannels == numChannels,
+      orElse: () => CallQuality.medium,
+    );
+
     _callPeer = contact;
     _callId = env.data['callId'] as String? ?? const Uuid().v4();
     setState(() => _callPhase = CallPhase.incomingRinging);
@@ -1841,7 +1900,17 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_callPhase != CallPhase.incomingRinging || _callPeer == null) return;
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
-    final env = Envelope(type: 'call_accept', senderId: _myDeviceId, senderName: _myDisplayName, to: _callPeer!.uniqueId, data: {'callId': _callId});
+    final env = Envelope(
+      type: 'call_accept',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: _callPeer!.uniqueId,
+      data: {
+        'callId': _callId,
+        'sampleRate': _activeCallQuality.sampleRate,
+        'numChannels': _activeCallQuality.numChannels,
+      },
+    );
     setState(() => _callPhase = CallPhase.active);
     try {
       await _sendEnvelope(env);
@@ -1863,6 +1932,14 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _handleCallAccept(Envelope env) async {
     if (_callPhase != CallPhase.outgoingRinging || env.data['callId'] != _callId) return;
     _callTimeoutTimer?.cancel();
+
+    final sampleRate = env.data['sampleRate'] as int? ?? _callQuality.sampleRate;
+    final numChannels = env.data['numChannels'] as int? ?? _callQuality.numChannels;
+    _activeCallQuality = CallQuality.values.firstWhere(
+      (q) => q.sampleRate == sampleRate && q.numChannels == numChannels,
+      orElse: () => _callQuality,
+    );
+
     setState(() => _callPhase = CallPhase.active);
     await _startRealtimeAudio();
   }
@@ -1883,6 +1960,14 @@ class _HomeScreenState extends State<HomeScreen> {
     if (env.data['callId'] != _callId) return;
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
+
+    final sampleRate = env.data['sampleRate'] as int? ?? _callQuality.sampleRate;
+    final numChannels = env.data['numChannels'] as int? ?? _callQuality.numChannels;
+    _activeCallQuality = CallQuality.values.firstWhere(
+      (q) => q.sampleRate == sampleRate && q.numChannels == numChannels,
+      orElse: () => _callQuality,
+    );
+
     setState(() => _callPhase = CallPhase.active);
     await _startRealtimeAudio();
   }
@@ -1890,7 +1975,17 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _emergencyForceStart() async {
     if (_callPhase != CallPhase.outgoingRinging || _callPeer == null) return;
     _callTimeoutTimer?.cancel();
-    final env = Envelope(type: 'call_force_start', senderId: _myDeviceId, senderName: _myDisplayName, to: _callPeer!.uniqueId, data: {'callId': _callId});
+    final env = Envelope(
+      type: 'call_force_start',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: _callPeer!.uniqueId,
+      data: {
+        'callId': _callId,
+        'sampleRate': _activeCallQuality.sampleRate,
+        'numChannels': _activeCallQuality.numChannels,
+      },
+    );
     setState(() => _callPhase = CallPhase.active);
     try {
       await _sendEnvelope(env);
@@ -1917,12 +2012,13 @@ class _HomeScreenState extends State<HomeScreen> {
       _callPhase = CallPhase.idle;
       _callPeer = null;
       _callId = '';
+      _activeCallQuality = _callQuality;
     });
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  REALTIME AUDIO – WITH JITTER BUFFER
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Future<void> _startRealtimeAudio() async {
     final targetIp = _callPeer?.deviceAddress;
@@ -1938,38 +2034,24 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    // Clear jitter buffer
-    _audioQueue.clear();
-    _isPlaying = true;
+    final int sampleRate = _activeCallQuality.sampleRate;
+    final int numChannels = _activeCallQuality.numChannels;
+    final int bytesPerFrame = numChannels * 2;
+    const int frameDurationMs = 20;
+    final int frameSize = (sampleRate * frameDurationMs ~/ 1000) * bytesPerFrame;
 
-    final int sampleRate = _callQuality.sampleRate;
-    final int numChannels = _callQuality.numChannels;
-    final int bytesPerFrame = numChannels * 2; // PCM16
-    final int frameSize = (sampleRate * 0.02).round() * bytesPerFrame; // 20ms frames
+    _audioBuffer.clear();
+    _callPlaybackStarted = false;
+    final int targetBytes = frameSize * 10;
+    const int maxBufferMs = 400;
+    final int maxBufferBytes = frameSize * (maxBufferMs ~/ frameDurationMs);
 
-    // Playback timer – consumes from queue at steady rate
-    _playbackTimer = Timer.periodic(Duration(milliseconds: 20), (timer) async {
-      if (!_isPlaying || _callPhase != CallPhase.active) {
-        timer.cancel();
-        return;
-      }
-      if (_audioQueue.length < 2) {
-        // Underrun – send silence to keep player alive
-        final silence = Uint8List(frameSize);
-        _callPlayer.uint8ListSink?.add(silence);
-        return;
-      }
-      final data = _audioQueue.removeFirst();
-      _callPlayer.uint8ListSink?.add(data);
-    });
-
-    // Start player with stream sink
     try {
       await _callPlayer.startPlayerFromStream(
         codec: Codec.pcm16,
         numChannels: numChannels,
         sampleRate: sampleRate,
-        bufferSize: 8192,
+        bufferSize: frameSize * 4,
         interleaved: true,
       );
     } catch (e) {
@@ -1979,7 +2061,7 @@ class _HomeScreenState extends State<HomeScreen> {
           codec: Codec.pcm16,
           numChannels: 1,
           sampleRate: 16000,
-          bufferSize: 8192,
+          bufferSize: 640,
           interleaved: true,
         );
       } catch (e2) {
@@ -1988,22 +2070,6 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
 
-    // Socket listener – add incoming packets to queue
-    _callSocketSub = _callSocket!.listen((event) {
-      if (event != RawSocketEvent.read) return;
-      final dg = _callSocket!.receive();
-      if (dg != null && dg.data.isNotEmpty) {
-        // Limit queue size to prevent memory bloat
-        if (_audioQueue.length < 200) {
-          _audioQueue.add(dg.data);
-        } else {
-          _audioQueue.removeFirst();
-          _audioQueue.add(dg.data);
-        }
-      }
-    });
-
-    // Microphone stream
     _micStreamController = StreamController<Uint8List>();
     _micStreamSub = _micStreamController!.stream.listen((data) {
       final ip = _callPeer?.deviceAddress;
@@ -2013,14 +2079,13 @@ class _HomeScreenState extends State<HomeScreen> {
       } catch (_) {}
     });
 
-    // Start recording
     try {
       await _audioRecorder.startRecorder(
         toStream: _micStreamController!.sink,
         codec: Codec.pcm16,
         numChannels: numChannels,
         sampleRate: sampleRate,
-        bufferSize: 8192,
+        bufferSize: frameSize * 2,
       );
     } catch (e) {
       debugPrint('CALL MIC START ERROR: $e — retrying at safe mono 16kHz');
@@ -2030,18 +2095,57 @@ class _HomeScreenState extends State<HomeScreen> {
           codec: Codec.pcm16,
           numChannels: 1,
           sampleRate: 16000,
-          bufferSize: 8192,
+          bufferSize: 640,
         );
       } catch (e2) {
         _endCall(reason: 'This device could not start the microphone stream: $e2');
       }
     }
+
+    _isPlaying = true;
+    _callSocketSub = _callSocket!.listen((event) {
+      if (event != RawSocketEvent.read) return;
+      final dg = _callSocket!.receive();
+      if (dg == null || dg.data.isEmpty) return;
+
+      _audioBuffer.addAll(dg.data);
+
+      if (_audioBuffer.length > maxBufferBytes) {
+        final drop = _audioBuffer.length - maxBufferBytes;
+        _audioBuffer.removeRange(0, drop);
+      }
+
+      if (!_callPlaybackStarted && _audioBuffer.length >= targetBytes) {
+        _callPlaybackStarted = true;
+        _startPlaybackTimer(frameSize, frameDurationMs);
+      }
+    });
+  }
+
+  void _startPlaybackTimer(int frameSize, int frameDurationMs) {
+    _playbackTimer?.cancel();
+    _playbackTimer = Timer.periodic(Duration(milliseconds: frameDurationMs), (timer) {
+      if (!_isPlaying || _callPhase != CallPhase.active) {
+        timer.cancel();
+        return;
+      }
+
+      if (_audioBuffer.length >= frameSize) {
+        final frame = Uint8List.fromList(_audioBuffer.sublist(0, frameSize));
+        _callPlayer.uint8ListSink?.add(frame);
+        _audioBuffer.removeRange(0, frameSize);
+      } else {
+        _callPlayer.uint8ListSink?.add(Uint8List(frameSize));
+      }
+    });
   }
 
   Future<void> _stopRealtimeAudio() async {
     _isPlaying = false;
+    _callPlaybackStarted = false;
     _playbackTimer?.cancel();
     _playbackTimer = null;
+    _audioBuffer.clear();
     try {
       await _audioRecorder.stopRecorder();
     } catch (_) {}
@@ -2056,12 +2160,11 @@ class _HomeScreenState extends State<HomeScreen> {
     _callSocketSub = null;
     _callSocket?.close();
     _callSocket = null;
-    _audioQueue.clear();
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  BLOCKING / MISC
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Future<void> _toggleBlockContact(Contact c) async {
     c.isBlocked = !c.isBlocked;
@@ -2085,11 +2188,11 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('DISCONNECT ERROR: $e');
     }
     await _hostStateSub?.cancel();
+    await _clientStateSub?.cancel();
     await _hostClientsSub?.cancel();
     await _hostTextSub?.cancel();
-    await _hostFilesSub?.cancel();
-    await _clientStateSub?.cancel();
     await _clientTextSub?.cancel();
+    await _hostFilesSub?.cancel();
     await _clientFilesSub?.cancel();
     await _scanSub?.cancel();
     _stopHeartbeat();
@@ -2156,9 +2259,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   ImageProvider? _avatarImage(String? b64) => b64 == null ? null : MemoryImage(base64Decode(b64));
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  UI
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   @override
   Widget build(BuildContext context) {
@@ -2189,9 +2292,9 @@ class _HomeScreenState extends State<HomeScreen> {
     return _buildContactsList();
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  TOP BAR (with offline status and typing)
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildTopBar() {
     final peer = _selectedContact;
@@ -2256,9 +2359,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  SETTINGS SHEET
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   void _openSettingsSheet() {
     showModalBottomSheet(
@@ -2398,9 +2501,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  ROLE SELECTION
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildRoleSelection() {
     return Center(
@@ -2454,9 +2557,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  CLIENT HOST LIST
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildClientHostList() {
     if (_discoveredHosts.isEmpty) return _loadingPanel('Scanning for hosts nearby…');
@@ -2487,9 +2590,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  CONTACTS LIST
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildContactsList() {
     final contacts = _contactBox.values.toList()..sort((a, b) => b.lastSeen.compareTo(a.lastSeen));
@@ -2541,7 +2644,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     : () {
                         setState(() => _selectedContact = c);
                         _markThreadRead(c.uniqueId);
-                        _startHeartbeat(); // <-- 🔥 FIX: start heartbeat when selecting a contact
+                        _startHeartbeat();
                       },
               ),
             ),
@@ -2572,9 +2675,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  CHAT AREA
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildChatArea() {
     final contactId = _selectedContact!.uniqueId;
@@ -2594,9 +2697,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  MESSAGE BUBBLE (with status icons)
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildMessageBubble(ChatMessage msg) {
     final isVoice = msg.type == 'voice';
@@ -2717,9 +2820,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  //  COMPOSER (with typing detection)
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
+  //  COMPOSER (with typing detection and voice FX toggle)
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildComposer() {
     return GlassPanel(
@@ -2731,7 +2834,44 @@ class _HomeScreenState extends State<HomeScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: Row(
           children: [
-            IconButton(icon: Icon(Icons.attach_file_rounded, color: _fgDim, size: 20), onPressed: _pickAndSendFile),
+            IconButton(
+              icon: Icon(Icons.attach_file_rounded, color: _fgDim, size: 20),
+              onPressed: _pickAndSendFile,
+            ),
+
+            // FX toggle
+            GestureDetector(
+              onTap: () {
+                setState(() {
+                  _voiceEffect = VoiceEffect.values[(_voiceEffect.index + 1) % VoiceEffect.values.length];
+                });
+              },
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                decoration: BoxDecoration(
+                  color: _voiceEffect == VoiceEffect.normal
+                      ? Colors.transparent
+                      : const Color(0xFF7C4DFF).withOpacity(0.35),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: _voiceEffect == VoiceEffect.normal ? Colors.transparent : const Color(0xFF7C4DFF),
+                    width: 1,
+                  ),
+                ),
+                child: Text(
+                  _voiceEffect == VoiceEffect.normal
+                      ? 'FX'
+                      : (_voiceEffect == VoiceEffect.minion ? '🐿️' : '🐢'),
+                  style: TextStyle(
+                    color: _fg,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+
             GestureDetector(
               onLongPressStart: (_) => _startRecordingVoiceMessage(),
               onLongPressEnd: (_) => _stopRecordingAndSendVoiceMessage(),
@@ -2764,9 +2904,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  RECORDING OVERLAY
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildRecordingOverlay() {
     return Positioned(
@@ -2809,9 +2949,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  CALL OVERLAY
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildCallOverlay() {
     final peer = _callPeer;
@@ -2841,7 +2981,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   Text(_callStatusLabel(), style: TextStyle(color: _fgDim, fontSize: 14)),
                   if (_callPhase == CallPhase.active) ...[
                     const SizedBox(height: 4),
-                    Text('Live · ${_callQuality.label}', style: TextStyle(color: _fgFaint, fontSize: 11)),
+                    Text('Live · ${_activeCallQuality.label}', style: TextStyle(color: _fgFaint, fontSize: 11)),
                   ],
                 ],
               ),
@@ -2900,9 +3040,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
   //  DISPOSE
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════════
 
   @override
   void dispose() {
@@ -2936,3 +3076,4 @@ class CancelToken {
   void cancel() => _cancelled = true;
   bool get isCancelled => _cancelled;
 }
+     
