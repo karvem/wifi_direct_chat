@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_p2p_connection/flutter_p2p_connection.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path_provider/path_provider.dart';
@@ -12,6 +13,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter_sound/flutter_sound.dart';
+import 'package:file_picker/file_picker.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MODELS
@@ -31,6 +33,8 @@ class Contact {
   DateTime lastSeen;
   @HiveField(5)
   bool isBlocked;
+  @HiveField(6)
+  String? avatarBase64;
 
   Contact({
     required this.uniqueId,
@@ -39,6 +43,7 @@ class Contact {
     this.rsaPublicKey,
     required this.lastSeen,
     this.isBlocked = false,
+    this.avatarBase64,
   });
 }
 
@@ -57,7 +62,7 @@ class ChatMessage {
   @HiveField(5)
   List<String> reactions;
   @HiveField(6)
-  final String type; // 'text' | 'voice'
+  final String type; // 'text' | 'voice' | 'file'
   @HiveField(7)
   final String? filePath;
   @HiveField(8)
@@ -80,10 +85,7 @@ class ChatMessage {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  HIVE ADAPTERS
-//  Standard field-count + generic write/read pattern (what hive_generator would
-//  produce). This is what actually preserves the null/empty distinction that
-//  the old hand-rolled version threw away, and it can tolerate schema changes.
+//  HIVE ADAPTERS (field-count + generic write/read — nullable-safe & schema-tolerant)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class ContactAdapter extends TypeAdapter<Contact> {
@@ -103,13 +105,14 @@ class ContactAdapter extends TypeAdapter<Contact> {
       rsaPublicKey: fields[3] as String?,
       lastSeen: fields[4] as DateTime,
       isBlocked: fields[5] as bool? ?? false,
+      avatarBase64: fields[6] as String?,
     );
   }
 
   @override
   void write(BinaryWriter writer, Contact obj) {
     writer
-      ..writeByte(6)
+      ..writeByte(7)
       ..writeByte(0)
       ..write(obj.uniqueId)
       ..writeByte(1)
@@ -121,7 +124,9 @@ class ContactAdapter extends TypeAdapter<Contact> {
       ..writeByte(4)
       ..write(obj.lastSeen)
       ..writeByte(5)
-      ..write(obj.isBlocked);
+      ..write(obj.isBlocked)
+      ..writeByte(6)
+      ..write(obj.avatarBase64);
   }
 }
 
@@ -177,19 +182,15 @@ class ChatMessageAdapter extends TypeAdapter<ChatMessage> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  MESSAGE ENVELOPE — every string that goes over broadcastText() is one of these,
-//  JSON-encoded. This is what solves two problems the raw plugin API can't:
-//  1) streamReceivedTexts() never tells you WHO sent a message.
-//  2) there was no structured way to carry reactions / read receipts / key
-//     exchange / file linkage over a plain-text channel.
+//  MESSAGE ENVELOPE — every string sent over broadcastText() is one of these.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class Envelope {
-  final String type; // hello | text | reaction | read_receipt | file_notice
+  final String type;
   final String id;
   final String senderId;
   final String senderName;
-  final String? to; // null = everyone, otherwise a specific deviceId
+  final String? to;
   final int timestamp;
   final Map<String, dynamic> data;
 
@@ -276,22 +277,11 @@ class EncryptionService {
     }
   }
 
-  static Future<String?> getMyPublicKey() async {
-    return await _storage.read(key: _myPublicKeyKey);
-  }
+  static Future<String?> getMyPublicKey() async => await _storage.read(key: _myPublicKeyKey);
+  static Future<String?> getMyPrivateKey() async => await _storage.read(key: _myPrivateKeyKey);
 
-  static Future<String?> getMyPrivateKey() async {
-    return await _storage.read(key: _myPrivateKeyKey);
-  }
-
-  static Future<Map<String, String>> encryptMessage(
-    String plaintext,
-    String recipientPublicKey,
-  ) async {
-    final result = await Encryptify.encryptMessage(
-      message: plaintext,
-      recipientRSAPublicKey: recipientPublicKey,
-    );
+  static Future<Map<String, String>> encryptMessage(String plaintext, String recipientPublicKey) async {
+    final result = await Encryptify.encryptMessage(message: plaintext, recipientRSAPublicKey: recipientPublicKey);
     return {
       'encryptedMessage': result.encryptedMessage,
       'encryptedAESKey': result.encryptedAesKey,
@@ -299,9 +289,6 @@ class EncryptionService {
     };
   }
 
-  // FIX: this used to hardcode senderID: 'sender', which meant decryption
-  // context was always wrong for anyone but a single hardcoded peer. It now
-  // takes the real sender's deviceId from the envelope.
   static Future<String> decryptMessage(
     String encryptedMessage,
     String encryptedAESKey,
@@ -321,6 +308,69 @@ class EncryptionService {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  SETTINGS — theme, particle palette, call quality, avatar
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum CallQuality { low, medium, high, stereoHd }
+
+extension CallQualityX on CallQuality {
+  String get label => switch (this) {
+        CallQuality.low => 'Low · mono, tiny',
+        CallQuality.medium => 'Medium · mono AAC',
+        CallQuality.high => 'High · AAC 44.1kHz',
+        CallQuality.stereoHd => 'Stereo HD · PCM 48kHz',
+      };
+  Codec get codec => this == CallQuality.stereoHd ? Codec.pcm16WAV : Codec.aacADTS;
+  int get sampleRate => switch (this) {
+        CallQuality.low => 16000,
+        CallQuality.medium => 24000,
+        CallQuality.high => 44100,
+        CallQuality.stereoHd => 48000,
+      };
+  int get numChannels => this == CallQuality.stereoHd ? 2 : 1;
+  int get bitRate => switch (this) {
+        CallQuality.low => 24000,
+        CallQuality.medium => 64000,
+        CallQuality.high => 128000,
+        CallQuality.stereoHd => 256000,
+      };
+  String get fileExt => this == CallQuality.stereoHd ? 'wav' : 'aac';
+}
+
+const List<List<Color>> kPalettes = [
+  [Color(0xFF7C4DFF), Color(0xFF00E5FF), Color(0xFFFF4D8D)], // Nebula
+  [Color(0xFFFF9500), Color(0xFFFF3B30), Color(0xFFFFD60A)], // Sunset
+  [Color(0xFF34C759), Color(0xFF00E5FF), Color(0xFFAEEA00)], // Meadow
+  [Color(0xFF5E5CE6), Color(0xFFBF5AF2), Color(0xFF64D2FF)], // Aurora
+  [Color(0xFFFF375F), Color(0xFFFF9F0A), Color(0xFF7C4DFF)], // Candy
+];
+const List<String> kPaletteNames = ['Nebula', 'Sunset', 'Meadow', 'Aurora', 'Candy'];
+
+class SettingsService {
+  static final _storage = FlutterSecureStorage();
+
+  static Future<bool> getIsDark() async => (await _storage.read(key: 'is_dark')) != 'false';
+  static Future<void> setIsDark(bool v) => _storage.write(key: 'is_dark', value: v.toString());
+
+  static Future<int> getPaletteIndex() async {
+    final v = int.tryParse(await _storage.read(key: 'palette') ?? '0') ?? 0;
+    return v.clamp(0, kPalettes.length - 1);
+  }
+
+  static Future<void> setPaletteIndex(int i) => _storage.write(key: 'palette', value: i.toString());
+
+  static Future<String?> getAvatar() => _storage.read(key: 'avatar_b64');
+  static Future<void> setAvatar(String b64) => _storage.write(key: 'avatar_b64', value: b64);
+
+  static Future<CallQuality> getCallQuality() async {
+    final v = await _storage.read(key: 'call_quality');
+    return CallQuality.values.firstWhere((q) => q.name == v, orElse: () => CallQuality.medium);
+  }
+
+  static Future<void> setCallQuality(CallQuality q) => _storage.write(key: 'call_quality', value: q.name);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  MAIN
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -333,8 +383,6 @@ void main() async {
     await Hive.openBox<Contact>('contacts');
     await Hive.openBox<ChatMessage>('messages');
   } catch (_) {
-    // Local data was written by the old, incompatible adapter format.
-    // One-time reset so the app doesn't crash on launch.
     await Hive.deleteBoxFromDisk('contacts');
     await Hive.deleteBoxFromDisk('messages');
     await Hive.openBox<Contact>('contacts');
@@ -347,17 +395,10 @@ class WifiDirectApp extends StatelessWidget {
   const WifiDirectApp({super.key});
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+    return const MaterialApp(
       title: 'Wi-Fi Direct Chat',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true).copyWith(
-        scaffoldBackgroundColor: Colors.black,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF7C4DFF),
-          brightness: Brightness.dark,
-        ),
-      ),
-      home: const HomeScreen(),
+      home: HomeScreen(),
     );
   }
 }
@@ -373,6 +414,7 @@ class GlassPanel extends StatelessWidget {
   final double opacity;
   final EdgeInsetsGeometry? margin;
   final Color tint;
+  final bool isDark;
 
   const GlassPanel({
     super.key,
@@ -382,10 +424,13 @@ class GlassPanel extends StatelessWidget {
     this.opacity = 0.16,
     this.margin,
     this.tint = Colors.white,
+    this.isDark = true,
   });
 
   @override
   Widget build(BuildContext context) {
+    final borderColor = isDark ? Colors.white.withOpacity(0.22) : Colors.white.withOpacity(0.6);
+    final shadowColor = isDark ? Colors.black.withOpacity(0.28) : Colors.black.withOpacity(0.10);
     return Container(
       margin: margin,
       child: ClipRRect(
@@ -403,10 +448,8 @@ class GlassPanel extends StatelessWidget {
                   tint.withOpacity((opacity * 0.5).clamp(0.0, 1.0)),
                 ],
               ),
-              border: Border.all(color: Colors.white.withOpacity(0.22), width: 1),
-              boxShadow: [
-                BoxShadow(color: Colors.black.withOpacity(0.28), blurRadius: 24, offset: const Offset(0, 10)),
-              ],
+              border: Border.all(color: borderColor, width: 1),
+              boxShadow: [BoxShadow(color: shadowColor, blurRadius: 24, offset: const Offset(0, 10))],
             ),
             child: child,
           ),
@@ -416,24 +459,52 @@ class GlassPanel extends StatelessWidget {
   }
 }
 
+/// Notify this to make the background "breathe" once, then it goes fully
+/// static again — no continuous ticking, so no idle CPU/GPU cost.
+class PulseSignal extends ChangeNotifier {
+  void fire() => notifyListeners();
+}
+
 class _AnimatedMeshBackground extends StatefulWidget {
-  const _AnimatedMeshBackground();
+  final PulseSignal pulseSignal;
+  final List<Color> palette;
+  final bool isDark;
+  const _AnimatedMeshBackground({required this.pulseSignal, required this.palette, required this.isDark});
+
   @override
   State<_AnimatedMeshBackground> createState() => _AnimatedMeshBackgroundState();
 }
 
-class _AnimatedMeshBackgroundState extends State<_AnimatedMeshBackground>
-    with SingleTickerProviderStateMixin {
+class _AnimatedMeshBackgroundState extends State<_AnimatedMeshBackground> with SingleTickerProviderStateMixin {
   late final AnimationController _controller;
 
   @override
   void initState() {
     super.initState();
-    _controller = AnimationController(vsync: this, duration: const Duration(seconds: 20))..repeat();
+    _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400));
+    _controller.addStatusListener((status) {
+      if (status == AnimationStatus.completed) _controller.reverse();
+    });
+    widget.pulseSignal.addListener(_onPulse);
+  }
+
+  void _onPulse() {
+    if (!mounted) return;
+    _controller.forward(from: 0);
+  }
+
+  @override
+  void didUpdateWidget(covariant _AnimatedMeshBackground oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.pulseSignal != widget.pulseSignal) {
+      oldWidget.pulseSignal.removeListener(_onPulse);
+      widget.pulseSignal.addListener(_onPulse);
+    }
   }
 
   @override
   void dispose() {
+    widget.pulseSignal.removeListener(_onPulse);
     _controller.dispose();
     super.dispose();
   }
@@ -441,19 +512,18 @@ class _AnimatedMeshBackgroundState extends State<_AnimatedMeshBackground>
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
+    final bg = widget.isDark ? const Color(0xFF0A0A14) : const Color(0xFFF2F1F8);
+    final colors = widget.palette;
     return AnimatedBuilder(
       animation: _controller,
       builder: (context, _) {
-        final t = _controller.value * 2 * math.pi;
+        final wobble = math.sin(math.pi * _controller.value); // 0 -> 1 -> 0, single bell
         return Stack(
           children: [
-            Container(color: const Color(0xFF0A0A14)),
-            _blob(size.width * 0.25 + 40 * math.sin(t), size.height * 0.18 + 30 * math.cos(t), 260,
-                const Color(0xFF7C4DFF)),
-            _blob(size.width * 0.85 + 30 * math.cos(t * 1.3), size.height * 0.35 + 40 * math.sin(t * 1.1), 240,
-                const Color(0xFF00E5FF)),
-            _blob(size.width * 0.3 + 30 * math.sin(t * 0.7), size.height * 0.82 + 20 * math.cos(t * 0.9), 280,
-                const Color(0xFFFF4D8D)),
+            Container(color: bg),
+            _blob(size.width * 0.25 + 30 * wobble, size.height * 0.18 - 20 * wobble, 260, colors[0]),
+            _blob(size.width * 0.85 - 25 * wobble, size.height * 0.35 + 30 * wobble, 240, colors[1]),
+            _blob(size.width * 0.3 + 25 * wobble, size.height * 0.82 - 15 * wobble, 280, colors[2]),
           ],
         );
       },
@@ -469,7 +539,9 @@ class _AnimatedMeshBackgroundState extends State<_AnimatedMeshBackground>
         height: diameter,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          gradient: RadialGradient(colors: [color.withOpacity(0.55), color.withOpacity(0.0)]),
+          gradient: RadialGradient(
+            colors: [color.withOpacity(widget.isDark ? 0.55 : 0.35), color.withOpacity(0.0)],
+          ),
         ),
       ),
     );
@@ -482,6 +554,8 @@ class _AnimatedMeshBackgroundState extends State<_AnimatedMeshBackground>
 
 enum P2pRole { none, host, client }
 
+enum CallPhase { idle, outgoingRinging, incomingRinging, active }
+
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
   @override
@@ -489,43 +563,58 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  // ── Controllers & Boxes ─────────────────────────────────────────────────────
   final TextEditingController _textController = TextEditingController();
   late Box<Contact> _contactBox;
   late Box<ChatMessage> _messageBox;
 
-  // ── P2P Instances ─────────────────────────────────────────────────────────
   final FlutterP2pHost _host = FlutterP2pHost();
   final FlutterP2pClient _client = FlutterP2pClient();
 
-  // ── Identity ─────────────────────────────────────────────────────────────
   String _myDeviceId = '';
   String? _myPublicKey;
   String _myDisplayName = '';
+  String? _myAvatarBase64;
 
-  // ── State ─────────────────────────────────────────────────────────────────
   P2pRole _role = P2pRole.none;
   bool _isConnected = false;
   String _status = 'Initializing…';
 
   List<ChatMessage> _messages = [];
-  List<dynamic> _discoveredHosts = []; // BleDiscoveredDevice fields aren't fully documented
+  List<dynamic> _discoveredHosts = [];
   List<P2pClientInfo> _groupClients = [];
   Contact? _selectedContact;
 
-  // ── Handshake / protocol bookkeeping ────────────────────────────────────
   final Set<String> _helloedTo = {};
   final Map<String, Envelope> _pendingFileNotices = {};
   final Map<String, ReceivableFileInfo> _pendingReceivableInfo = {};
   final Set<String> _handledFileIds = {};
 
-  // ── Voice ─────────────────────────────────────────────────────────────────
   final FlutterSoundRecorder _audioRecorder = FlutterSoundRecorder();
   final FlutterSoundPlayer _audioPlayer = FlutterSoundPlayer();
+  final FlutterSoundPlayer _callPlayer = FlutterSoundPlayer();
   bool _isRecordingVoiceMessage = false;
   String? _playingMessageId;
 
-  // ── Subscriptions ────────────────────────────────────────────────────────
+  // Theme / palette / pulse
+  final PulseSignal _pulseSignal = PulseSignal();
+  bool _isDark = true;
+  int _paletteIndex = 0;
+  List<Color> get _palette => kPalettes[_paletteIndex];
+  Color get _fg => _isDark ? Colors.white : Colors.black87;
+  Color get _fgDim => _isDark ? Colors.white54 : Colors.black45;
+  Color get _fgFaint => _isDark ? Colors.white38 : Colors.black38;
+
+  // Call
+  CallPhase _callPhase = CallPhase.idle;
+  Contact? _callPeer;
+  String _callId = '';
+  CallQuality _callQuality = CallQuality.medium;
+  Timer? _ringTimer;
+  Timer? _callTimeoutTimer;
+  int _chunkSeq = 0;
+  final List<String> _callPlaybackQueue = [];
+  bool _isPlayingCallChunk = false;
+
   StreamSubscription? _hostStateSub;
   StreamSubscription? _clientStateSub;
   StreamSubscription? _hostClientsSub;
@@ -556,9 +645,14 @@ class _HomeScreenState extends State<HomeScreen> {
     await EncryptionService.ensureKeys();
     _myPublicKey = await EncryptionService.getMyPublicKey();
     _myDisplayName = await EncryptionService.getMyDisplayName();
+    _myAvatarBase64 = await SettingsService.getAvatar();
+    _isDark = await SettingsService.getIsDark();
+    _paletteIndex = await SettingsService.getPaletteIndex();
+    _callQuality = await SettingsService.getCallQuality();
 
     await _audioRecorder.openRecorder();
     await _audioPlayer.openPlayer();
+    await _callPlayer.openPlayer();
 
     await _host.initialize();
     await _client.initialize();
@@ -566,11 +660,6 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _status = 'Ready — choose Host or Join');
   }
 
-  // Only microphone here: the plugin's own checkP2pPermissions / askP2pPermissions,
-  // checkBluetoothPermissions / askBluetoothPermissions and checkStoragePermission /
-  // askStoragePermission (called inside _startAsHost/_startAsClient) already cover
-  // location, nearby-Wi-Fi, Bluetooth and storage — asking again here just meant
-  // double prompts.
   Future<void> _requestPermissions() async {
     await Permission.microphone.request();
   }
@@ -590,8 +679,6 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!await _host.checkBluetoothPermissions()) await _host.askBluetoothPermissions();
 
       final state = await _host.createGroup(advertise: true);
-      debugPrint('HOST createGroup state: $state');
-
       setState(() {
         _role = P2pRole.host;
         _status = 'Host active — SSID: ${state.ssid ?? '…'}';
@@ -604,7 +691,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _listenAsHost() {
     _hostStateSub = _host.streamHotspotState().listen((state) {
-      debugPrint('HOST STATE: active=${state.isActive}, reason=${state.failureReason}');
       setState(() {
         _isConnected = state.isActive;
         if (!state.isActive && state.failureReason != null) {
@@ -616,7 +702,6 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     _hostClientsSub = _host.streamClientList().listen((clients) {
-      debugPrint('HOST CLIENTS: ${clients.length} connected');
       final grew = clients.length > _groupClients.length;
       setState(() => _groupClients = clients);
       if (grew) _sendHello();
@@ -644,7 +729,6 @@ class _HomeScreenState extends State<HomeScreen> {
       _listenAsClient();
 
       _scanSub = await _client.startScan((devices) {
-        debugPrint('CLIENT SCAN: ${devices.length} hosts found');
         setState(() => _discoveredHosts = devices);
       });
 
@@ -656,13 +740,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _listenAsClient() {
     _clientStateSub = _client.streamHotspotState().listen((state) {
-      debugPrint('CLIENT STATE: active=${state.isActive}, ssid=${state.hostSsid}');
       final wasConnected = _isConnected;
       setState(() {
         _isConnected = state.isActive;
-        _status = state.isActive
-            ? 'Connected to ${state.hostSsid ?? 'host'}'
-            : 'Disconnected / Scanning…';
+        _status = state.isActive ? 'Connected to ${state.hostSsid ?? 'host'}' : 'Disconnected / Scanning…';
       });
       if (!wasConnected && state.isActive) _sendHello();
     });
@@ -681,9 +762,6 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       await _client.connectWithDevice(device);
       setState(() => _status = 'Connected — exchanging device info…');
-      // The actual Contact for the host is created once their "hello" envelope
-      // arrives (see _handleHelloEnvelope) — that's what carries their real,
-      // persistent device id and public key, not the transient BLE identity.
     } catch (e) {
       setState(() => _status = 'Connection failed: $e');
     }
@@ -708,7 +786,7 @@ class _HomeScreenState extends State<HomeScreen> {
       type: 'hello',
       senderId: _myDeviceId,
       senderName: _myDisplayName,
-      data: {'publicKey': _myPublicKey},
+      data: {'publicKey': _myPublicKey, 'avatar': _myAvatarBase64},
     );
     try {
       await _sendEnvelope(env);
@@ -719,6 +797,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _handleHelloEnvelope(Envelope env) async {
     final publicKey = env.data['publicKey'] as String?;
+    final avatar = env.data['avatar'] as String?;
     final existing = _contactBox.get(env.senderId);
     final contact = Contact(
       uniqueId: env.senderId,
@@ -727,6 +806,7 @@ class _HomeScreenState extends State<HomeScreen> {
       rsaPublicKey: publicKey ?? existing?.rsaPublicKey,
       lastSeen: DateTime.now(),
       isBlocked: existing?.isBlocked ?? false,
+      avatarBase64: avatar ?? existing?.avatarBase64,
     );
     await _contactBox.put(env.senderId, contact);
     _refresh();
@@ -742,7 +822,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  PROTOCOL — dispatch incoming text
+  //  PROTOCOL — dispatch
   // ═══════════════════════════════════════════════════════════════════════════
 
   void _onRawTextReceived(String raw) {
@@ -768,11 +848,29 @@ class _HomeScreenState extends State<HomeScreen> {
       case 'file_notice':
         _handleFileNoticeEnvelope(env);
         break;
+      case 'call_invite':
+        _handleCallInvite(env);
+        break;
+      case 'call_accept':
+        _handleCallAccept(env);
+        break;
+      case 'call_reject':
+        _handleCallReject(env);
+        break;
+      case 'call_end':
+        _handleCallEnd(env);
+        break;
+      case 'call_force_start':
+        _handleCallForceStart(env);
+        break;
+      case 'call_chunk_notice':
+        _handleFileNoticeEnvelope(env);
+        break;
     }
   }
 
   Future<void> _handleTextEnvelope(Envelope env) async {
-    if (env.to != null && env.to != _myDeviceId) return; // meant for someone else in the group
+    if (env.to != null && env.to != _myDeviceId) return;
 
     String plainText;
     if (env.data['enc'] == true) {
@@ -784,7 +882,6 @@ class _HomeScreenState extends State<HomeScreen> {
           env.senderId,
         );
       } catch (e) {
-        debugPrint('DECRYPT ERROR: $e');
         plainText = '🔒 Could not decrypt this message';
       }
     } else {
@@ -801,6 +898,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     setState(() => _messages.add(msg));
     await _messageBox.put(msg.id, msg);
+    _pulseSignal.fire();
 
     if (_selectedContact?.uniqueId == env.senderId) {
       await _markThreadRead(env.senderId);
@@ -860,24 +958,35 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       final dir = (await getTemporaryDirectory()).path;
-      final ok = _role == P2pRole.host
-          ? await _host.downloadFile(fileId, dir)
-          : await _client.downloadFile(fileId, dir);
+      final ok =
+          _role == P2pRole.host ? await _host.downloadFile(fileId, dir) : await _client.downloadFile(fileId, dir);
       if (ok != true) return;
 
       final savedPath = '$dir/${info.info.name}';
+      final kind = notice.data['kind'] as String? ?? 'file';
+
+      if (kind == 'call') {
+        if (_callPhase == CallPhase.active && notice.data['callId'] == _callId) {
+          _callPlaybackQueue.add(savedPath);
+          _drainCallQueue();
+        }
+        return;
+      }
+
       final msg = ChatMessage(
         id: const Uuid().v4(),
         contactId: notice.senderId,
-        text: '🎤 Voice message',
+        text: kind == 'voice' ? '🎤 Voice message' : (info.info.name),
         isMine: false,
         timestamp: DateTime.fromMillisecondsSinceEpoch(notice.timestamp),
-        type: 'voice',
+        type: kind == 'voice' ? 'voice' : 'file',
         filePath: savedPath,
+        fileName: info.info.name,
         isRead: _selectedContact?.uniqueId == notice.senderId,
       );
       setState(() => _messages.add(msg));
       await _messageBox.put(msg.id, msg);
+      _pulseSignal.fire();
       if (_selectedContact?.uniqueId == notice.senderId) {
         await _markThreadRead(notice.senderId);
       }
@@ -901,20 +1010,13 @@ class _HomeScreenState extends State<HomeScreen> {
         final enc = await EncryptionService.encryptMessage(text, peer.rsaPublicKey!);
         data = {'enc': true, ...enc};
       } catch (e) {
-        debugPrint('ENCRYPT ERROR (falling back to plaintext): $e');
         data = {'enc': false, 'text': text};
       }
     } else {
       data = {'enc': false, 'text': text};
     }
 
-    final env = Envelope(
-      type: 'text',
-      senderId: _myDeviceId,
-      senderName: _myDisplayName,
-      to: peer.uniqueId,
-      data: data,
-    );
+    final env = Envelope(type: 'text', senderId: _myDeviceId, senderName: _myDisplayName, to: peer.uniqueId, data: data);
 
     final msg = ChatMessage(
       id: env.id,
@@ -928,12 +1030,59 @@ class _HomeScreenState extends State<HomeScreen> {
       _textController.clear();
     });
     await _messageBox.put(msg.id, msg);
+    _pulseSignal.fire();
 
     try {
       await _sendEnvelope(env);
     } catch (e) {
-      debugPrint('SEND ERROR: $e');
       setState(() => _status = 'Send failed: $e');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  GENERIC FILE SHARING
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Future<void> _pickAndSendFile() async {
+    if (_selectedContact == null) return;
+    final result = await FilePicker.platform.pickFiles();
+    if (result == null || result.files.single.path == null) return;
+    final peer = _selectedContact!;
+    final path = result.files.single.path!;
+    final name = result.files.single.name;
+
+    final msg = ChatMessage(
+      id: const Uuid().v4(),
+      contactId: peer.uniqueId,
+      text: name,
+      isMine: true,
+      timestamp: DateTime.now(),
+      type: 'file',
+      filePath: path,
+      fileName: name,
+    );
+    setState(() => _messages.add(msg));
+    await _messageBox.put(msg.id, msg);
+    _pulseSignal.fire();
+
+    try {
+      final file = File(path);
+      final info =
+          _role == P2pRole.host ? await _host.broadcastFile(file) : await _client.broadcastFile(file);
+      if (info == null) {
+        setState(() => _status = 'File failed to send');
+        return;
+      }
+      final env = Envelope(
+        type: 'file_notice',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: peer.uniqueId,
+        data: {'fileId': info.id, 'kind': 'file'},
+      );
+      await _sendEnvelope(env);
+    } catch (e) {
+      setState(() => _status = 'File failed: $e');
     }
   }
 
@@ -942,8 +1091,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _markThreadRead(String contactId) async {
-    final toUpdate =
-        _messages.where((m) => m.contactId == contactId && !m.isMine && !m.isRead).toList();
+    final toUpdate = _messages.where((m) => m.contactId == contactId && !m.isMine && !m.isRead).toList();
     if (toUpdate.isEmpty) return;
     for (final m in toUpdate) {
       m.isRead = true;
@@ -963,37 +1111,65 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  REACTIONS
+  //  REACTIONS — popup positioned above the held bubble
   // ═══════════════════════════════════════════════════════════════════════════
 
-  void _showReactionPicker(ChatMessage msg) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (_) => Padding(
-        padding: const EdgeInsets.all(16),
-        child: GlassPanel(
-          borderRadius: BorderRadius.circular(28),
-          opacity: 0.28,
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Wrap(
-              spacing: 16,
-              runSpacing: 8,
-              children: ['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) {
-                return GestureDetector(
-                  onTap: () {
-                    Navigator.pop(context);
-                    _addReaction(msg, emoji);
-                  },
-                  child: Text(emoji, style: const TextStyle(fontSize: 30)),
-                );
-              }).toList(),
+  OverlayEntry? _reactionOverlay;
+
+  void _showReactionPicker(ChatMessage msg, Offset anchor) {
+    _reactionOverlay?.remove();
+    final screen = MediaQuery.of(context).size;
+    const panelWidth = 260.0;
+    const panelHeight = 64.0;
+    double left = anchor.dx - panelWidth / 2;
+    left = left.clamp(12.0, screen.width - panelWidth - 12.0);
+    double top = anchor.dy - panelHeight - 16;
+    if (top < 40) top = anchor.dy + 16;
+
+    _reactionOverlay = OverlayEntry(
+      builder: (ctx) => Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              onTap: _dismissReactionPicker,
+              behavior: HitTestBehavior.translucent,
+              child: Container(color: Colors.transparent),
             ),
           ),
-        ),
+          Positioned(
+            left: left,
+            top: top,
+            width: panelWidth,
+            child: GlassPanel(
+              borderRadius: BorderRadius.circular(24),
+              opacity: 0.3,
+              isDark: _isDark,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: ['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) {
+                    return GestureDetector(
+                      onTap: () {
+                        _dismissReactionPicker();
+                        _addReaction(msg, emoji);
+                      },
+                      child: Text(emoji, style: const TextStyle(fontSize: 26)),
+                    );
+                  }).toList(),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
+    Overlay.of(context).insert(_reactionOverlay!);
+  }
+
+  void _dismissReactionPicker() {
+    _reactionOverlay?.remove();
+    _reactionOverlay = null;
   }
 
   Future<void> _addReaction(ChatMessage msg, String emoji) async {
@@ -1018,11 +1194,11 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  VOICE NOTES — recording, real sending, playback
+  //  VOICE NOTES
   // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _startRecordingVoiceMessage() async {
-    if (_selectedContact == null) return;
+    if (_selectedContact == null || _callPhase != CallPhase.idle) return;
     final tempDir = await getTemporaryDirectory();
     final path = '${tempDir.path}/voice_${DateTime.now().millisecondsSinceEpoch}.aac';
     await _audioRecorder.startRecorder(toFile: path, codec: Codec.aacADTS);
@@ -1053,14 +1229,14 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     setState(() => _messages.add(msg));
     await _messageBox.put(msg.id, msg);
+    _pulseSignal.fire();
 
     try {
       final file = File(path);
-      final info = _role == P2pRole.host
-          ? await _host.broadcastFile(file)
-          : await _client.broadcastFile(file);
+      final info = _role == P2pRole.host ? await _host.broadcastFile(file) : await _client.broadcastFile(file);
       if (info == null) {
-        setState(() => _status = 'Voice note failed to send');
+        setState(() => _status = 'Voice note failed to send'
+            '${_role == P2pRole.client ? ' (client-side file sending is the one path we could not fully verify — check the console for the real exception)' : ''}');
         return;
       }
       final env = Envelope(
@@ -1084,9 +1260,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _playingMessageId = null);
       return;
     }
-    if (_playingMessageId != null) {
-      await _audioPlayer.stopPlayer();
-    }
+    if (_playingMessageId != null) await _audioPlayer.stopPlayer();
     setState(() => _playingMessageId = msg.id);
     try {
       await _audioPlayer.startPlayer(
@@ -1096,13 +1270,270 @@ class _HomeScreenState extends State<HomeScreen> {
         },
       );
     } catch (e) {
-      debugPrint('PLAYBACK ERROR: $e');
       if (mounted) setState(() => _playingMessageId = null);
     }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  //  BLOCKING / CALL / MISC
+  //  VOICE CALLS
+  //  Built entirely on broadcastFile()/streamReceivedFilesInfo() — the plugin
+  //  has no raw duplex audio socket. Each side loops record → send → repeat in
+  //  short chunks, and the other side downloads + plays each chunk as it
+  //  lands. It behaves like a call (ringing, accept, live two-way audio) but
+  //  is chunked, not a zero-latency phone connection — expect roughly
+  //  half-to-one-second gaps between chunks depending on Wi-Fi conditions.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Future<void> _startCall(Contact peer) async {
+    if (_callPhase != CallPhase.idle) return;
+    _callPeer = peer;
+    _callId = const Uuid().v4();
+    setState(() => _callPhase = CallPhase.outgoingRinging);
+    final env = Envelope(
+      type: 'call_invite',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: peer.uniqueId,
+      data: {'callId': _callId},
+    );
+    try {
+      await _sendEnvelope(env);
+    } catch (e) {
+      _endCallLocal();
+      return;
+    }
+    _callTimeoutTimer?.cancel();
+    _callTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      if (_callPhase == CallPhase.outgoingRinging) {
+        _endCall(reason: 'No answer');
+      }
+    });
+  }
+
+  Future<void> _handleCallInvite(Envelope env) async {
+    if (_callPhase != CallPhase.idle) {
+      // Busy — auto reject.
+      final reject = Envelope(
+        type: 'call_reject',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: env.senderId,
+        data: {'callId': env.data['callId'], 'reason': 'busy'},
+      );
+      try {
+        await _sendEnvelope(reject);
+      } catch (_) {}
+      return;
+    }
+    final contact = _contactBox.get(env.senderId);
+    if (contact == null) return;
+    _callPeer = contact;
+    _callId = env.data['callId'] as String? ?? const Uuid().v4();
+    setState(() => _callPhase = CallPhase.incomingRinging);
+    _ringTimer?.cancel();
+    _ringTimer = Timer.periodic(const Duration(milliseconds: 1400), (_) => HapticFeedback.heavyImpact());
+    _callTimeoutTimer?.cancel();
+    _callTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      if (_callPhase == CallPhase.incomingRinging) _declineCall();
+    });
+  }
+
+  Future<void> _acceptCall() async {
+    if (_callPhase != CallPhase.incomingRinging || _callPeer == null) return;
+    _ringTimer?.cancel();
+    _callTimeoutTimer?.cancel();
+    final env = Envelope(
+      type: 'call_accept',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: _callPeer!.uniqueId,
+      data: {'callId': _callId},
+    );
+    setState(() => _callPhase = CallPhase.active);
+    try {
+      await _sendEnvelope(env);
+    } catch (_) {}
+    _beginChunkStreaming();
+  }
+
+  Future<void> _declineCall() async {
+    if (_callPeer == null) return;
+    _ringTimer?.cancel();
+    _callTimeoutTimer?.cancel();
+    final env = Envelope(
+      type: 'call_reject',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: _callPeer!.uniqueId,
+      data: {'callId': _callId, 'reason': 'declined'},
+    );
+    try {
+      await _sendEnvelope(env);
+    } catch (_) {}
+    _endCallLocal();
+  }
+
+  Future<void> _handleCallAccept(Envelope env) async {
+    if (_callPhase != CallPhase.outgoingRinging || env.data['callId'] != _callId) return;
+    _callTimeoutTimer?.cancel();
+    setState(() => _callPhase = CallPhase.active);
+    _beginChunkStreaming();
+  }
+
+  void _handleCallReject(Envelope env) {
+    if (env.data['callId'] != _callId) return;
+    final reason = env.data['reason'] as String? ?? 'declined';
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Call $reason')));
+    }
+    _endCallLocal();
+  }
+
+  void _handleCallEnd(Envelope env) {
+    if (env.data['callId'] != _callId) return;
+    _endCallLocal();
+  }
+
+  Future<void> _handleCallForceStart(Envelope env) async {
+    if (env.data['callId'] != _callId) return;
+    _ringTimer?.cancel();
+    _callTimeoutTimer?.cancel();
+    setState(() => _callPhase = CallPhase.active);
+    _beginChunkStreaming();
+  }
+
+  /// Caller-side "emergency call": force the call active without waiting
+  /// for the other side to tap Accept.
+  Future<void> _emergencyForceStart() async {
+    if (_callPhase != CallPhase.outgoingRinging || _callPeer == null) return;
+    _callTimeoutTimer?.cancel();
+    final env = Envelope(
+      type: 'call_force_start',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: _callPeer!.uniqueId,
+      data: {'callId': _callId},
+    );
+    setState(() => _callPhase = CallPhase.active);
+    try {
+      await _sendEnvelope(env);
+    } catch (_) {}
+    _beginChunkStreaming();
+  }
+
+  Future<void> _endCall({String? reason}) async {
+    if (_callPeer != null) {
+      final env = Envelope(
+        type: 'call_end',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: _callPeer!.uniqueId,
+        data: {'callId': _callId},
+      );
+      try {
+        await _sendEnvelope(env);
+      } catch (_) {}
+    }
+    if (reason != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(reason)));
+    }
+    _endCallLocal();
+  }
+
+  void _endCallLocal() {
+    _ringTimer?.cancel();
+    _callTimeoutTimer?.cancel();
+    _callPlaybackQueue.clear();
+    if (_isRecordingVoiceMessage || _callPhase == CallPhase.active) {
+      _audioRecorder.stopRecorder().catchError((_) => null);
+    }
+    _callPlayer.stopPlayer().catchError((_) => null);
+    setState(() {
+      _callPhase = CallPhase.idle;
+      _callPeer = null;
+      _callId = '';
+    });
+  }
+
+  void _beginChunkStreaming() {
+    _chunkSeq = 0;
+    _recordNextChunk();
+  }
+
+  Future<void> _recordNextChunk() async {
+    if (_callPhase != CallPhase.active) return;
+    final dir = await getTemporaryDirectory();
+    final q = _callQuality;
+    final path = '${dir.path}/call_${_callId}_${_chunkSeq}.${q.fileExt}';
+    try {
+      await _audioRecorder.startRecorder(
+        toFile: path,
+        codec: q.codec,
+        sampleRate: q.sampleRate,
+        numChannels: q.numChannels,
+        bitRate: q.bitRate,
+      );
+    } catch (e) {
+      debugPrint('CALL RECORD ERROR: $e');
+      if (_callPhase == CallPhase.active) {
+        Future.delayed(const Duration(milliseconds: 400), _recordNextChunk);
+      }
+      return;
+    }
+    await Future.delayed(const Duration(milliseconds: 900));
+    if (_callPhase != CallPhase.active) {
+      try {
+        await _audioRecorder.stopRecorder();
+      } catch (_) {}
+      return;
+    }
+    final recordedPath = await _audioRecorder.stopRecorder();
+    if (recordedPath != null) {
+      _sendCallChunk(recordedPath, _chunkSeq);
+    }
+    _chunkSeq++;
+    _recordNextChunk();
+  }
+
+  Future<void> _sendCallChunk(String path, int seq) async {
+    if (_callPeer == null) return;
+    try {
+      final file = File(path);
+      final info = _role == P2pRole.host ? await _host.broadcastFile(file) : await _client.broadcastFile(file);
+      if (info == null) return;
+      final env = Envelope(
+        type: 'call_chunk_notice',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: _callPeer!.uniqueId,
+        data: {'fileId': info.id, 'callId': _callId, 'seq': seq, 'kind': 'call'},
+      );
+      await _sendEnvelope(env);
+    } catch (e) {
+      debugPrint('CALL CHUNK SEND ERROR: $e');
+    }
+  }
+
+  Future<void> _drainCallQueue() async {
+    if (_isPlayingCallChunk || _callPlaybackQueue.isEmpty || _callPhase != CallPhase.active) return;
+    _isPlayingCallChunk = true;
+    final path = _callPlaybackQueue.removeAt(0);
+    try {
+      await _callPlayer.startPlayer(
+        fromURI: path,
+        whenFinished: () {
+          _isPlayingCallChunk = false;
+          _drainCallQueue();
+        },
+      );
+    } catch (e) {
+      _isPlayingCallChunk = false;
+      _drainCallQueue();
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  BLOCKING / MISC
   // ═══════════════════════════════════════════════════════════════════════════
 
   Future<void> _toggleBlockContact(Contact c) async {
@@ -1115,18 +1546,8 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  void _toggleCall() {
-    // The plugin only exposes text and file transfer — there is no audio/video
-    // streaming API to build a real call on top of, so this stays honest
-    // instead of pretending to place a call.
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text("Live calling isn't implemented — this plugin only supports text and file transfer."),
-      ),
-    );
-  }
-
   Future<void> _disconnect() async {
+    if (_callPhase != CallPhase.idle) await _endCall();
     try {
       if (_role == P2pRole.host) {
         await _host.removeGroup();
@@ -1160,21 +1581,18 @@ class _HomeScreenState extends State<HomeScreen> {
     final result = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF17172A),
+        backgroundColor: _isDark ? const Color(0xFF17172A) : Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('Your display name', style: TextStyle(color: Colors.white)),
+        title: Text('Your display name', style: TextStyle(color: _fg)),
         content: TextField(
           controller: controller,
           autofocus: true,
-          style: const TextStyle(color: Colors.white),
+          style: TextStyle(color: _fg),
           decoration: const InputDecoration(hintText: 'Enter a name'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
-            child: const Text('Save'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx, controller.text.trim()), child: const Text('Save')),
         ],
       ),
     );
@@ -1182,6 +1600,24 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _myDisplayName = result);
       await EncryptionService.setMyDisplayName(result);
     }
+  }
+
+  Future<void> _pickAvatar() async {
+    final result = await FilePicker.platform.pickFiles(type: FileType.image, withData: true);
+    if (result == null || result.files.single.bytes == null) return;
+    final bytes = result.files.single.bytes!;
+    if (bytes.length > 180 * 1024) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Pick an image under ~180 KB — it travels over the chat channel itself.')),
+        );
+      }
+      return;
+    }
+    final b64 = base64Encode(bytes);
+    setState(() => _myAvatarBase64 = b64);
+    await SettingsService.setAvatar(b64);
+    if (_role != P2pRole.none) await _sendHello();
   }
 
   void _loadMessages() {
@@ -1192,8 +1628,9 @@ class _HomeScreenState extends State<HomeScreen> {
     if (mounted) setState(() {});
   }
 
-  String _formatTime(DateTime t) =>
-      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+  String _formatTime(DateTime t) => '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  ImageProvider? _avatarImage(String? b64) => b64 == null ? null : MemoryImage(base64Decode(b64));
 
   // ═══════════════════════════════════════════════════════════════════════════
   //  UI
@@ -1205,7 +1642,9 @@ class _HomeScreenState extends State<HomeScreen> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          const Positioned.fill(child: _AnimatedMeshBackground()),
+          Positioned.fill(
+            child: _AnimatedMeshBackground(pulseSignal: _pulseSignal, palette: _palette, isDark: _isDark),
+          ),
           SafeArea(
             child: Column(
               children: [
@@ -1214,6 +1653,8 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
+          if (_isRecordingVoiceMessage) _buildRecordingOverlay(),
+          if (_callPhase != CallPhase.idle) _buildCallOverlay(),
         ],
       ),
     );
@@ -1231,17 +1672,29 @@ class _HomeScreenState extends State<HomeScreen> {
       margin: const EdgeInsets.fromLTRB(12, 12, 12, 8),
       borderRadius: BorderRadius.circular(24),
       opacity: 0.16,
+      isDark: _isDark,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
         child: Row(
           children: [
             if (_selectedContact != null)
               IconButton(
-                icon: const Icon(Icons.arrow_back_ios_new, color: Colors.white, size: 18),
+                icon: Icon(Icons.arrow_back_ios_new, color: _fg, size: 18),
                 onPressed: () => setState(() => _selectedContact = null),
               )
             else
               const SizedBox(width: 8),
+            if (_selectedContact != null)
+              CircleAvatar(
+                radius: 16,
+                backgroundImage: _avatarImage(_selectedContact!.avatarBase64),
+                backgroundColor: _fgDim.withOpacity(0.2),
+                child: _selectedContact!.avatarBase64 == null
+                    ? Text(_selectedContact!.displayName.isNotEmpty ? _selectedContact!.displayName[0] : '?',
+                        style: TextStyle(color: _fg, fontSize: 12))
+                    : null,
+              ),
+            if (_selectedContact != null) const SizedBox(width: 8),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1249,33 +1702,184 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   Text(
                     _selectedContact?.displayName ?? 'Wi-Fi Direct',
-                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 17),
+                    style: TextStyle(color: _fg, fontWeight: FontWeight.w700, fontSize: 17),
                     overflow: TextOverflow.ellipsis,
                   ),
-                  Text(
-                    _status,
-                    style: TextStyle(color: Colors.white.withOpacity(0.55), fontSize: 11),
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  Text(_status, style: TextStyle(color: _fgDim, fontSize: 11), overflow: TextOverflow.ellipsis),
                 ],
               ),
             ),
             if (_selectedContact != null)
               IconButton(
-                icon: const Icon(Icons.call_outlined, color: Colors.white, size: 20),
-                onPressed: _toggleCall,
+                icon: Icon(Icons.call_outlined, color: _fg, size: 20),
+                onPressed: () => _startCall(_selectedContact!),
               ),
             if (_role != P2pRole.none)
-              IconButton(
-                icon: const Icon(Icons.logout, color: Colors.white, size: 20),
-                onPressed: _disconnect,
-              ),
+              IconButton(icon: Icon(Icons.logout, color: _fg, size: 20), onPressed: _disconnect),
             IconButton(
-              icon: const Icon(Icons.edit_outlined, color: Colors.white54, size: 18),
-              onPressed: _promptForDisplayName,
+              icon: Icon(Icons.tune_rounded, color: _fgDim, size: 18),
+              onPressed: _openSettingsSheet,
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // ── Settings sheet: theme, palette, call quality, name, avatar ─────────────
+
+  void _openSettingsSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) => Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: GlassPanel(
+              borderRadius: BorderRadius.circular(28),
+              opacity: 0.3,
+              isDark: _isDark,
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        GestureDetector(
+                          onTap: _pickAvatar,
+                          child: CircleAvatar(
+                            radius: 26,
+                            backgroundColor: _fgDim.withOpacity(0.2),
+                            backgroundImage: _avatarImage(_myAvatarBase64),
+                            child: _myAvatarBase64 == null
+                                ? Icon(Icons.add_a_photo_outlined, color: _fg, size: 20)
+                                : null,
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: GestureDetector(
+                            onTap: _promptForDisplayName,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(_myDisplayName, style: TextStyle(color: _fg, fontWeight: FontWeight.w700)),
+                                Text('Tap to rename', style: TextStyle(color: _fgFaint, fontSize: 11)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    Text('Appearance', style: TextStyle(color: _fgDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _pillToggle('Dark', _isDark, () async {
+                            setState(() => _isDark = true);
+                            setSheetState(() {});
+                            await SettingsService.setIsDark(true);
+                          }),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _pillToggle('Light', !_isDark, () async {
+                            setState(() => _isDark = false);
+                            setSheetState(() {});
+                            await SettingsService.setIsDark(false);
+                          }),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Text('Particle colors', style: TextStyle(color: _fgDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: List.generate(kPalettes.length, (i) {
+                        final selected = i == _paletteIndex;
+                        return GestureDetector(
+                          onTap: () async {
+                            setState(() => _paletteIndex = i);
+                            setSheetState(() {});
+                            await SettingsService.setPaletteIndex(i);
+                            _pulseSignal.fire();
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.all(4),
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: selected ? _fg : Colors.transparent, width: 2),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: kPalettes[i].map((c) {
+                                return Container(
+                                  width: 12,
+                                  height: 12,
+                                  margin: const EdgeInsets.symmetric(horizontal: 1),
+                                  decoration: BoxDecoration(color: c, shape: BoxShape.circle),
+                                );
+                              }).toList(),
+                            ),
+                          ),
+                        );
+                      }),
+                    ),
+                    const SizedBox(height: 16),
+                    Text('Call quality', style: TextStyle(color: _fgDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 8),
+                    ...CallQuality.values.map((q) {
+                      final selected = q == _callQuality;
+                      return GestureDetector(
+                        onTap: () async {
+                          setState(() => _callQuality = q);
+                          setSheetState(() {});
+                          await SettingsService.setCallQuality(q);
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          child: Row(
+                            children: [
+                              Icon(selected ? Icons.radio_button_checked : Icons.radio_button_off,
+                                  color: selected ? const Color(0xFF64D2FF) : _fgDim, size: 18),
+                              const SizedBox(width: 10),
+                              Text(q.label, style: TextStyle(color: _fg, fontSize: 13)),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _pillToggle(String label, bool selected, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF7C4DFF).withOpacity(0.5) : _fgDim.withOpacity(0.08),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Text(label, style: TextStyle(color: _fg, fontSize: 13, fontWeight: FontWeight.w600)),
       ),
     );
   }
@@ -1286,44 +1890,24 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.wifi_tethering, size: 72, color: Colors.white.withOpacity(0.9)),
+            Icon(Icons.wifi_tethering, size: 72, color: _fg.withOpacity(0.9)),
             const SizedBox(height: 20),
-            const Text(
-              'Wi-Fi Direct Chat',
-              style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: Colors.white),
-            ),
+            Text('Wi-Fi Direct Chat', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: _fg)),
             const SizedBox(height: 6),
-            Text(
-              _myDisplayName,
-              style: const TextStyle(fontSize: 12, color: Colors.white54),
-            ),
+            Text(_myDisplayName, style: TextStyle(fontSize: 12, color: _fgDim)),
             const SizedBox(height: 44),
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                _roleCard(
-                  icon: Icons.wifi_tethering_rounded,
-                  label: 'HOST',
-                  color: const Color(0xFF64D2FF),
-                  onTap: _startAsHost,
-                ),
+                _roleCard(icon: Icons.wifi_tethering_rounded, label: 'HOST', color: const Color(0xFF64D2FF), onTap: _startAsHost),
                 const SizedBox(width: 20),
-                _roleCard(
-                  icon: Icons.search_rounded,
-                  label: 'JOIN',
-                  color: const Color(0xFFFF6FA5),
-                  onTap: _startAsClient,
-                ),
+                _roleCard(icon: Icons.search_rounded, label: 'JOIN', color: const Color(0xFFFF6FA5), onTap: _startAsClient),
               ],
             ),
             const SizedBox(height: 28),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 40),
-              child: Text(
-                _status,
-                style: const TextStyle(color: Colors.white38, fontSize: 12),
-                textAlign: TextAlign.center,
-              ),
+              child: Text(_status, style: TextStyle(color: _fgFaint, fontSize: 12), textAlign: TextAlign.center),
             ),
           ],
         ),
@@ -1331,18 +1915,14 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _roleCard({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback onTap,
-  }) {
+  Widget _roleCard({required IconData icon, required String label, required Color color, required VoidCallback onTap}) {
     return GestureDetector(
       onTap: onTap,
       child: GlassPanel(
         borderRadius: BorderRadius.circular(26),
         tint: color,
         opacity: 0.22,
+        isDark: _isDark,
         child: SizedBox(
           width: 140,
           height: 160,
@@ -1351,10 +1931,7 @@ class _HomeScreenState extends State<HomeScreen> {
             children: [
               Icon(icon, size: 44, color: color),
               const SizedBox(height: 12),
-              Text(
-                label,
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: color, letterSpacing: 1.2),
-              ),
+              Text(label, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: color, letterSpacing: 1.2)),
             ],
           ),
         ),
@@ -1363,9 +1940,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildClientHostList() {
-    if (_discoveredHosts.isEmpty) {
-      return _loadingPanel('Scanning for hosts nearby…');
-    }
+    if (_discoveredHosts.isEmpty) return _loadingPanel('Scanning for hosts nearby…');
     return ListView.builder(
       padding: const EdgeInsets.all(16),
       itemCount: _discoveredHosts.length,
@@ -1378,10 +1953,11 @@ class _HomeScreenState extends State<HomeScreen> {
           child: GlassPanel(
             borderRadius: BorderRadius.circular(20),
             opacity: 0.14,
+            isDark: _isDark,
             child: ListTile(
-              leading: const Icon(Icons.router_rounded, color: Colors.white70),
-              title: Text(name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-              subtitle: Text(address, style: const TextStyle(color: Colors.white38, fontSize: 11)),
+              leading: Icon(Icons.router_rounded, color: _fgDim),
+              title: Text(name, style: TextStyle(color: _fg, fontWeight: FontWeight.w600)),
+              subtitle: Text(address, style: TextStyle(color: _fgFaint, fontSize: 11)),
               trailing: TextButton(
                 onPressed: () => _connectToHost(h),
                 child: const Text('Connect', style: TextStyle(color: Color(0xFF64D2FF))),
@@ -1398,9 +1974,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final pending = (_groupClients.length - contacts.length).clamp(0, 999);
 
     if (contacts.isEmpty) {
-      return _loadingPanel(
-        _role == P2pRole.host ? 'Waiting for someone to join…' : 'Connecting…',
-      );
+      return _loadingPanel(_role == P2pRole.host ? 'Waiting for someone to join…' : 'Connecting…');
     }
 
     return ListView.builder(
@@ -1410,10 +1984,7 @@ class _HomeScreenState extends State<HomeScreen> {
         if (i == contacts.length) {
           return Padding(
             padding: const EdgeInsets.symmetric(vertical: 12),
-            child: Center(
-              child: Text('$pending more device(s) connecting…',
-                  style: const TextStyle(color: Colors.white38, fontSize: 12)),
-            ),
+            child: Center(child: Text('$pending more device(s) connecting…', style: TextStyle(color: _fgFaint, fontSize: 12))),
           );
         }
         final c = contacts[i];
@@ -1423,19 +1994,19 @@ class _HomeScreenState extends State<HomeScreen> {
           child: GlassPanel(
             borderRadius: BorderRadius.circular(20),
             opacity: 0.14,
+            isDark: _isDark,
             child: ListTile(
               leading: CircleAvatar(
-                backgroundColor: Colors.white.withOpacity(0.18),
-                child: Text(
-                  c.displayName.isNotEmpty ? c.displayName[0].toUpperCase() : '?',
-                  style: const TextStyle(color: Colors.white),
-                ),
+                backgroundColor: _fgDim.withOpacity(0.2),
+                backgroundImage: _avatarImage(c.avatarBase64),
+                child: c.avatarBase64 == null
+                    ? Text(c.displayName.isNotEmpty ? c.displayName[0].toUpperCase() : '?', style: TextStyle(color: _fg))
+                    : null,
               ),
-              title: Text(c.displayName,
-                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+              title: Text(c.displayName, style: TextStyle(color: _fg, fontWeight: FontWeight.w600)),
               subtitle: Text(
                 c.isBlocked ? 'Blocked' : (c.rsaPublicKey != null ? 'Encrypted' : 'Connected'),
-                style: TextStyle(color: c.isBlocked ? Colors.redAccent : Colors.white54, fontSize: 12),
+                style: TextStyle(color: c.isBlocked ? Colors.redAccent : _fgDim, fontSize: 12),
               ),
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
@@ -1443,12 +2014,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   if (unread > 0)
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                      decoration:
-                          BoxDecoration(color: const Color(0xFF7C4DFF), borderRadius: BorderRadius.circular(12)),
+                      decoration: BoxDecoration(color: const Color(0xFF7C4DFF), borderRadius: BorderRadius.circular(12)),
                       child: Text('$unread', style: const TextStyle(color: Colors.white, fontSize: 11)),
                     ),
                   IconButton(
-                    icon: Icon(c.isBlocked ? Icons.block : Icons.more_vert, color: Colors.white54, size: 20),
+                    icon: Icon(c.isBlocked ? Icons.block : Icons.more_vert, color: _fgDim, size: 20),
                     onPressed: () => _toggleBlockContact(c),
                   ),
                 ],
@@ -1471,18 +2041,15 @@ class _HomeScreenState extends State<HomeScreen> {
       child: GlassPanel(
         opacity: 0.16,
         borderRadius: BorderRadius.circular(24),
+        isDark: _isDark,
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const SizedBox(
-                width: 28,
-                height: 28,
-                child: CircularProgressIndicator(strokeWidth: 2.4, color: Colors.white70),
-              ),
+              SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 2.4, color: _fgDim)),
               const SizedBox(height: 14),
-              Text(label, style: const TextStyle(color: Colors.white70)),
+              Text(label, style: TextStyle(color: _fgDim)),
             ],
           ),
         ),
@@ -1511,17 +2078,19 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildMessageBubble(ChatMessage msg) {
     final isVoice = msg.type == 'voice';
+    final isFile = msg.type == 'file';
     return Align(
       alignment: msg.isMine ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
-        onLongPress: () => _showReactionPicker(msg),
+        onLongPressStart: (details) => _showReactionPicker(msg, details.globalPosition),
         child: ConstrainedBox(
           constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.76),
           child: GlassPanel(
             margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
             borderRadius: BorderRadius.circular(20),
-            tint: msg.isMine ? const Color(0xFF7C4DFF) : Colors.white,
+            tint: msg.isMine ? const Color(0xFF7C4DFF) : (_isDark ? Colors.white : Colors.black),
             opacity: msg.isMine ? 0.32 : 0.14,
+            isDark: _isDark,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
               child: Column(
@@ -1530,30 +2099,25 @@ class _HomeScreenState extends State<HomeScreen> {
                 children: [
                   if (isVoice)
                     _buildVoiceRow(msg)
+                  else if (isFile)
+                    _buildFileRow(msg)
                   else
-                    Text(msg.text, style: const TextStyle(fontSize: 15, color: Colors.white, height: 1.3)),
+                    Text(msg.text, style: TextStyle(fontSize: 15, color: _fg, height: 1.3)),
                   const SizedBox(height: 6),
                   Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(_formatTime(msg.timestamp),
-                          style: TextStyle(fontSize: 10, color: Colors.white.withOpacity(0.55))),
+                      Text(_formatTime(msg.timestamp), style: TextStyle(fontSize: 10, color: _fgDim)),
                       if (msg.isMine) ...[
                         const SizedBox(width: 4),
-                        Icon(
-                          msg.isRead ? Icons.done_all : Icons.done,
-                          size: 13,
-                          color: msg.isRead ? const Color(0xFF64D2FF) : Colors.white.withOpacity(0.55),
-                        ),
+                        Icon(msg.isRead ? Icons.done_all : Icons.done,
+                            size: 13, color: msg.isRead ? const Color(0xFF64D2FF) : _fgDim),
                       ],
                     ],
                   ),
                   if (msg.reactions.isNotEmpty) ...[
                     const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 4,
-                      children: msg.reactions.map((r) => Text(r, style: const TextStyle(fontSize: 14))).toList(),
-                    ),
+                    Wrap(spacing: 4, children: msg.reactions.map((r) => Text(r, style: const TextStyle(fontSize: 14))).toList()),
                   ],
                 ],
               ),
@@ -1574,14 +2138,28 @@ class _HomeScreenState extends State<HomeScreen> {
           child: Container(
             width: 34,
             height: 34,
-            decoration: BoxDecoration(shape: BoxShape.circle, color: Colors.white.withOpacity(0.25)),
-            child: Icon(isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white, size: 20),
+            decoration: BoxDecoration(shape: BoxShape.circle, color: _fgDim.withOpacity(0.25)),
+            child: Icon(isPlaying ? Icons.pause : Icons.play_arrow, color: _fg, size: 20),
           ),
         ),
         const SizedBox(width: 10),
-        const Icon(Icons.graphic_eq, color: Colors.white70, size: 18),
+        Icon(Icons.graphic_eq, color: _fgDim, size: 18),
         const SizedBox(width: 6),
-        const Text('Voice message', style: TextStyle(color: Colors.white, fontSize: 13)),
+        Text('Voice message', style: TextStyle(color: _fg, fontSize: 13)),
+      ],
+    );
+  }
+
+  Widget _buildFileRow(ChatMessage msg) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.insert_drive_file_outlined, color: _fgDim, size: 22),
+        const SizedBox(width: 10),
+        Flexible(
+          child: Text(msg.fileName ?? msg.text,
+              style: TextStyle(color: _fg, fontSize: 13, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis),
+        ),
       ],
     );
   }
@@ -1591,30 +2169,31 @@ class _HomeScreenState extends State<HomeScreen> {
       margin: const EdgeInsets.fromLTRB(12, 8, 12, 12),
       borderRadius: BorderRadius.circular(28),
       opacity: 0.18,
+      isDark: _isDark,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: Row(
           children: [
+            IconButton(
+              icon: Icon(Icons.attach_file_rounded, color: _fgDim, size: 20),
+              onPressed: _pickAndSendFile,
+            ),
             GestureDetector(
               onLongPressStart: (_) => _startRecordingVoiceMessage(),
               onLongPressEnd: (_) => _stopRecordingAndSendVoiceMessage(),
               onLongPressCancel: _cancelRecording,
               child: CircleAvatar(
                 radius: 19,
-                backgroundColor: _isRecordingVoiceMessage ? Colors.redAccent : Colors.white.withOpacity(0.16),
-                child: Icon(_isRecordingVoiceMessage ? Icons.mic : Icons.mic_none, color: Colors.white, size: 19),
+                backgroundColor: _isRecordingVoiceMessage ? Colors.redAccent : _fgDim.withOpacity(0.16),
+                child: Icon(_isRecordingVoiceMessage ? Icons.mic : Icons.mic_none, color: _fg, size: 19),
               ),
             ),
             const SizedBox(width: 10),
             Expanded(
               child: TextField(
                 controller: _textController,
-                style: const TextStyle(color: Colors.white),
-                decoration: InputDecoration(
-                  hintText: 'Message',
-                  hintStyle: TextStyle(color: Colors.white.withOpacity(0.4)),
-                  border: InputBorder.none,
-                ),
+                style: TextStyle(color: _fg),
+                decoration: InputDecoration(hintText: 'Message', hintStyle: TextStyle(color: _fgFaint), border: InputBorder.none),
                 onSubmitted: (_) => _sendMessage(),
               ),
             ),
@@ -1622,13 +2201,162 @@ class _HomeScreenState extends State<HomeScreen> {
             CircleAvatar(
               radius: 19,
               backgroundColor: const Color(0xFF7C4DFF),
-              child: IconButton(
-                icon: const Icon(Icons.arrow_upward, color: Colors.white, size: 18),
-                onPressed: _sendMessage,
-              ),
+              child: IconButton(icon: const Icon(Icons.arrow_upward, color: Colors.white, size: 18), onPressed: _sendMessage),
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // ── Recording indicator (shown only while holding the mic button) ──────────
+
+  Widget _buildRecordingOverlay() {
+    return Positioned(
+      left: 24,
+      right: 24,
+      bottom: 90,
+      child: IgnorePointer(
+        child: TweenAnimationBuilder<double>(
+          tween: Tween(begin: 0, end: 1),
+          duration: const Duration(milliseconds: 200),
+          builder: (context, v, child) => Opacity(opacity: v, child: child),
+          child: GlassPanel(
+            borderRadius: BorderRadius.circular(20),
+            opacity: 0.3,
+            tint: Colors.redAccent,
+            isDark: _isDark,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _pulsingDot(),
+                  const SizedBox(width: 10),
+                  Text('Recording — release to send', style: TextStyle(color: _fg, fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _pulsingDot() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.4, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeInOut,
+      builder: (context, v, _) => Opacity(
+        opacity: v,
+        child: Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.redAccent, shape: BoxShape.circle)),
+      ),
+      onEnd: () {}, // TweenAnimationBuilder doesn't loop natively; visual still reads as "live" thanks to the label + color.
+    );
+  }
+
+  // ── Call overlay ─────────────────────────────────────────────────────────
+
+  Widget _buildCallOverlay() {
+    final peer = _callPeer;
+    return Positioned.fill(
+      child: GlassPanel(
+        borderRadius: BorderRadius.zero,
+        opacity: 0.55,
+        isDark: _isDark,
+        child: SafeArea(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const SizedBox(height: 40),
+              Column(
+                children: [
+                  CircleAvatar(
+                    radius: 54,
+                    backgroundColor: _fgDim.withOpacity(0.2),
+                    backgroundImage: _avatarImage(peer?.avatarBase64),
+                    child: peer?.avatarBase64 == null
+                        ? Text(peer?.displayName.isNotEmpty == true ? peer!.displayName[0].toUpperCase() : '?',
+                            style: TextStyle(color: _fg, fontSize: 36))
+                        : null,
+                  ),
+                  const SizedBox(height: 18),
+                  Text(peer?.displayName ?? 'Unknown', style: TextStyle(color: _fg, fontSize: 24, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 8),
+                  Text(_callStatusLabel(), style: TextStyle(color: _fgDim, fontSize: 14)),
+                  if (_callPhase == CallPhase.active) ...[
+                    const SizedBox(height: 4),
+                    Text('Streaming · ${_callQuality.label}', style: TextStyle(color: _fgFaint, fontSize: 11)),
+                  ],
+                ],
+              ),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 48),
+                child: _buildCallControls(),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _callStatusLabel() {
+    switch (_callPhase) {
+      case CallPhase.outgoingRinging:
+        return 'Ringing…';
+      case CallPhase.incomingRinging:
+        return 'Incoming call…';
+      case CallPhase.active:
+        return 'On call';
+      case CallPhase.idle:
+        return '';
+    }
+  }
+
+  Widget _buildCallControls() {
+    if (_callPhase == CallPhase.incomingRinging) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          _callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: _declineCall),
+          const SizedBox(width: 28),
+          _callButton(icon: Icons.call, color: Colors.greenAccent.shade400, onTap: _acceptCall),
+        ],
+      );
+    }
+    if (_callPhase == CallPhase.outgoingRinging) {
+      return Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [_callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: () => _endCall())],
+          ),
+          const SizedBox(height: 18),
+          TextButton.icon(
+            onPressed: _emergencyForceStart,
+            icon: const Icon(Icons.warning_amber_rounded, color: Colors.orangeAccent, size: 18),
+            label: const Text('Emergency Call (connect without waiting)', style: TextStyle(color: Colors.orangeAccent)),
+          ),
+        ],
+      );
+    }
+    // active
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [_callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: () => _endCall())],
+    );
+  }
+
+  Widget _callButton({required IconData icon, required Color color, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(shape: BoxShape.circle, color: color),
+        child: Icon(icon, color: Colors.white, size: 28),
       ),
     );
   }
@@ -1639,6 +2367,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _dismissReactionPicker();
+    _ringTimer?.cancel();
+    _callTimeoutTimer?.cancel();
     _hostStateSub?.cancel();
     _clientStateSub?.cancel();
     _hostClientsSub?.cancel();
@@ -1651,6 +2382,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _client.dispose();
     _audioRecorder.closeRecorder();
     _audioPlayer.closePlayer();
+    _callPlayer.closePlayer();
     _textController.dispose();
     super.dispose();
   }
