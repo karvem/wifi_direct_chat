@@ -662,9 +662,10 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _playbackTimer;
   bool _isPlaying = false;
 
-  // Offline detection – FIXED
+  // Offline detection – CONSECUTIVE FAILURES
   Timer? _heartbeatTimer;
-  Timer? _pongTimeoutTimer; // <-- NEW: tracks ping response
+  int _consecutivePingFailures = 0;
+  static const int _maxPingFailures = 3; // increased tolerance
   bool _isPeerOnline = false;
 
   // Typing indicator
@@ -895,27 +896,51 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  HEARTBEAT – OFFLINE DETECTION (FIXED)
+  //  HEARTBEAT – FIXED (Consecutive failures)
   // ─────────────────────────────────────────────────────────────────────────────
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 5), (_) => _sendPing());
+    _consecutivePingFailures = 0; // reset counter
     _isPeerOnline = true;
     _updateOfflineStatus();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 5), (_) => _sendPing());
+    debugPrint('Heartbeat started');
+    // send first ping immediately
+    _sendPing();
   }
 
   void _stopHeartbeat() {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
-    _pongTimeoutTimer?.cancel(); // cancel any pending timeout
-    _pongTimeoutTimer = null;
+    _consecutivePingFailures = 0;
     _isPeerOnline = false;
     _updateOfflineStatus();
+    debugPrint('Heartbeat stopped');
   }
 
   Future<void> _sendPing() async {
     if (_selectedContact == null) return;
+
+    // Increment failure counter for this attempt.
+    _consecutivePingFailures++;
+    debugPrint('Ping attempt #$_consecutivePingFailures');
+
+    // If we've exceeded the threshold, declare offline.
+    if (_consecutivePingFailures > _maxPingFailures) {
+      if (_isPeerOnline) {
+        _isPeerOnline = false;
+        _updateOfflineStatus();
+        if (_callPhase != CallPhase.idle) {
+          _endCall(reason: 'Peer went offline');
+        }
+        debugPrint('Peer marked OFFLINE after $_consecutivePingFailures failures');
+      }
+      // Stop further sending for this cycle.
+      return;
+    }
+
+    // Send the ping
     final env = Envelope(
       type: 'ping',
       senderId: _myDeviceId,
@@ -925,21 +950,10 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     try {
       await _sendEnvelope(env);
-    } catch (_) {}
-
-    // Start a timeout to detect if pong is not received
-    _pongTimeoutTimer?.cancel();
-    _pongTimeoutTimer = Timer(const Duration(seconds: 3), () {
-      // No pong received within 3 seconds -> mark offline
-      if (_isPeerOnline) {
-        _isPeerOnline = false;
-        _updateOfflineStatus();
-        // If call is active, end it
-        if (_callPhase != CallPhase.idle) {
-          _endCall(reason: 'Peer went offline');
-        }
-      }
-    });
+      debugPrint('Ping sent');
+    } catch (e) {
+      debugPrint('Failed to send ping: $e');
+    }
   }
 
   void _handlePing(Envelope env) {
@@ -951,24 +965,27 @@ class _HomeScreenState extends State<HomeScreen> {
       data: {'timestamp': DateTime.now().millisecondsSinceEpoch},
     );
     _sendEnvelope(pong);
+    debugPrint('Pong sent in reply to ping from ${env.senderId}');
   }
 
   void _handlePong(Envelope env) {
-    // Cancel the timeout timer because we got a response
-    _pongTimeoutTimer?.cancel();
-    _pongTimeoutTimer = null;
+    // Reset failure counter – we got a response!
+    if (_consecutivePingFailures > 0) {
+      debugPrint('Pong received, resetting failure counter (was $_consecutivePingFailures)');
+    }
+    _consecutivePingFailures = 0;
 
     if (!_isPeerOnline) {
       _isPeerOnline = true;
       _updateOfflineStatus();
       _deliverPendingMessages();
+      debugPrint('Peer back online');
     }
     _isPeerOnline = true;
   }
 
   void _updateOfflineStatus() {
     setState(() {});
-    // If call is active and peer goes offline, end call.
     if (!_isPeerOnline && _callPhase != CallPhase.idle) {
       _endCall(reason: 'Peer went offline');
     }
@@ -2524,6 +2541,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     : () {
                         setState(() => _selectedContact = c);
                         _markThreadRead(c.uniqueId);
+                        _startHeartbeat(); // <-- 🔥 FIX: start heartbeat when selecting a contact
                       },
               ),
             ),
@@ -2893,7 +2911,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _callTimeoutTimer?.cancel();
     _stopRealtimeAudio();
     _heartbeatTimer?.cancel();
-    _pongTimeoutTimer?.cancel();
     _typingDebounceTimer?.cancel();
     _offlineRetryTimer?.cancel();
     _hostStateSub?.cancel();
@@ -2913,10 +2930,6 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  CANCEL TOKEN
-// ─────────────────────────────────────────────────────────────────────────────
 
 class CancelToken {
   bool _cancelled = false;
