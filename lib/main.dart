@@ -2043,6 +2043,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: numChannels);
       await FlutterPcmSound.setFeedThreshold((sampleRate * 0.05).round()); // 50ms
       FlutterPcmSound.setFeedCallback(_onPcmFeed);
+      _isPlaying = true; // must be true BEFORE start(), which fires the first feed event immediately
       await FlutterPcmSound.start();
       _pcmSoundReady = true;
     } catch (e) {
@@ -2086,7 +2087,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     // ── UDP → flutter_pcm_sound buffer ──
-    _isPlaying = true;
     _callSocketSub = _callSocket!.listen((event) {
       if (event != RawSocketEvent.read) return;
       final dg = _callSocket!.receive();
