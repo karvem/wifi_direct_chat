@@ -1481,7 +1481,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  Future<void> _startRealtimeAudio() async {
+    Future<void> _startRealtimeAudio() async {
     final targetIp = _callPeer?.deviceAddress;
     if (targetIp == null) {
       _endCall(reason: "Missing peer network address — can't start audio");
@@ -1499,16 +1499,28 @@ class _HomeScreenState extends State<HomeScreen> {
       if (event != RawSocketEvent.read) return;
       final dg = _callSocket!.receive();
       if (dg != null && dg.data.isNotEmpty) {
-        _callPlayer.foodSink?.add(FoodData(dg.data));
+        // FIX #1: foodSink → uint8ListSink, no FoodData wrapper
+        _callPlayer.uint8ListSink?.add(dg.data);
       }
     });
 
     try {
-      await _callPlayer.startPlayerFromStream(codec: Codec.pcm16, numChannels: _callQuality.numChannels, sampleRate: _callQuality.sampleRate);
+      // FIX #2: add required bufferSize parameter
+      await _callPlayer.startPlayerFromStream(
+        codec: Codec.pcm16,
+        numChannels: _callQuality.numChannels,
+        sampleRate: _callQuality.sampleRate,
+        bufferSize: 8192,
+      );
     } catch (e) {
       debugPrint('CALL PLAYER START ERROR: $e — retrying at safe mono 16kHz');
       try {
-        await _callPlayer.startPlayerFromStream(codec: Codec.pcm16, numChannels: 1, sampleRate: 16000);
+        await _callPlayer.startPlayerFromStream(
+          codec: Codec.pcm16,
+          numChannels: 1,
+          sampleRate: 16000,
+          bufferSize: 8192,
+        );
       } catch (e2) {
         _endCall(reason: 'This device could not start live call playback: $e2');
         return;
@@ -1525,21 +1537,31 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     try {
+      // FIX #3: toStream still works but now feeds Uint8List directly (no FoodData)
+      // Also added bufferSize for recorder-to-stream (new in 9.30.0)
       await _audioRecorder.startRecorder(
         toStream: _micStreamController!.sink,
         codec: Codec.pcm16,
         numChannels: _callQuality.numChannels,
         sampleRate: _callQuality.sampleRate,
+        bufferSize: 8192,
       );
     } catch (e) {
       debugPrint('CALL MIC START ERROR: $e — retrying at safe mono 16kHz');
       try {
-        await _audioRecorder.startRecorder(toStream: _micStreamController!.sink, codec: Codec.pcm16, numChannels: 1, sampleRate: 16000);
+        await _audioRecorder.startRecorder(
+          toStream: _micStreamController!.sink,
+          codec: Codec.pcm16,
+          numChannels: 1,
+          sampleRate: 16000,
+          bufferSize: 8192,
+        );
       } catch (e2) {
         _endCall(reason: 'This device could not start the microphone stream: $e2');
       }
     }
   }
+
 
   Future<void> _stopRealtimeAudio() async {
     try {
