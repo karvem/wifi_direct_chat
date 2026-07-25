@@ -9,9 +9,9 @@ dependencies:
   flutter:
     sdk: flutter
 
-  open_file: ^3.3.2          # opens files with the default app
-  share_plus: ^7.2.1         # share/save files via system share sheet
-  file_saver: any            # optional, but you can use share_plus to save too
+  open_file: ^3.3.2
+  share_plus: ^7.2.1
+  cross_file: ^0.3.4  # already used by share_plus, but add explicitly
   flutter_p2p_connection: ^3.0.3
   permission_handler: ^11.4.0
   file_picker: ^10.2.0
