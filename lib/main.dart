@@ -657,7 +657,7 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamSubscription? _callSocketSub;
   StreamController<Uint8List>? _micStreamController;
   StreamSubscription? _micStreamSub;
-  // Jitter buffer for calls
+  // Jitter buffer
   final Queue<Uint8List> _audioQueue = Queue();
   Timer? _playbackTimer;
   bool _isPlaying = false;
@@ -1251,6 +1251,20 @@ class _HomeScreenState extends State<HomeScreen> {
 
   OverlayEntry? _reactionOverlay;
 
+  void _handleReactionEnvelope(Envelope env) {
+    final messageId = env.data['messageId'] as String?;
+    final emoji = env.data['emoji'] as String?;
+    if (messageId == null || emoji == null) return;
+    final stored = _messageBox.get(messageId);
+    if (stored == null) return;
+    stored.reactions.add(emoji);
+    _messageBox.put(messageId, stored);
+    final idx = _messages.indexWhere((m) => m.id == messageId);
+    setState(() {
+      if (idx != -1) _messages[idx] = stored;
+    });
+  }
+
   void _showReactionPicker(ChatMessage msg, Offset anchor) {
     _reactionOverlay?.remove();
     final screen = MediaQuery.of(context).size;
@@ -1545,7 +1559,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  FILE RECEIVE (existing code with slight modifications)
+  //  FILE RECEIVE
   // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _handleFileNoticeEnvelope(Envelope env) async {
@@ -2205,32 +2219,319 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  SETTINGS SHEET (unchanged)
+  //  SETTINGS SHEET
   // ─────────────────────────────────────────────────────────────────────────────
 
-  void _openSettingsSheet() { /* ... unchanged ... */ }
-  Widget _pillToggle(String label, bool selected, VoidCallback onTap) { /* ... unchanged ... */ }
+  void _openSettingsSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheetState) => Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: GlassPanel(
+              borderRadius: BorderRadius.circular(28),
+              opacity: 0.3,
+              isDark: _isDark,
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        GestureDetector(
+                          onTap: _pickAvatar,
+                          child: CircleAvatar(
+                            radius: 26,
+                            backgroundColor: _fgDim.withOpacity(0.2),
+                            backgroundImage: _avatarImage(_myAvatarBase64),
+                            child: _myAvatarBase64 == null ? Icon(Icons.add_a_photo_outlined, color: _fg, size: 20) : null,
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: GestureDetector(
+                            onTap: _promptForDisplayName,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(_myDisplayName, style: TextStyle(color: _fg, fontWeight: FontWeight.w700)),
+                                Text('Tap to rename', style: TextStyle(color: _fgFaint, fontSize: 11)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    Text('Appearance', style: TextStyle(color: _fgDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(child: _pillToggle('Dark', _isDark, () async {
+                          setState(() => _isDark = true);
+                          setSheetState(() {});
+                          await SettingsService.setIsDark(true);
+                        })),
+                        const SizedBox(width: 8),
+                        Expanded(child: _pillToggle('Light', !_isDark, () async {
+                          setState(() => _isDark = false);
+                          setSheetState(() {});
+                          await SettingsService.setIsDark(false);
+                        })),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Text('Particle colors', style: TextStyle(color: _fgDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: List.generate(kPalettes.length, (i) {
+                        final selected = i == _paletteIndex;
+                        return GestureDetector(
+                          onTap: () async {
+                            setState(() => _paletteIndex = i);
+                            setSheetState(() {});
+                            await SettingsService.setPaletteIndex(i);
+                            _pulseSignal.fire();
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.all(4),
+                            decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: selected ? _fg : Colors.transparent, width: 2)),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: kPalettes[i]
+                                  .map((c) => Container(width: 12, height: 12, margin: const EdgeInsets.symmetric(horizontal: 1), decoration: BoxDecoration(color: c, shape: BoxShape.circle)))
+                                  .toList(),
+                            ),
+                          ),
+                        );
+                      }),
+                    ),
+                    const SizedBox(height: 16),
+                    Text('Call quality', style: TextStyle(color: _fgDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 8),
+                    ...CallQuality.values.map((q) {
+                      final selected = q == _callQuality;
+                      return GestureDetector(
+                        onTap: () async {
+                          setState(() => _callQuality = q);
+                          setSheetState(() {});
+                          await SettingsService.setCallQuality(q);
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          child: Row(
+                            children: [
+                              Icon(selected ? Icons.radio_button_checked : Icons.radio_button_off, color: selected ? const Color(0xFF64D2FF) : _fgDim, size: 18),
+                              const SizedBox(width: 10),
+                              Text(q.label, style: TextStyle(color: _fg, fontSize: 13)),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _pillToggle(String label, bool selected, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(color: selected ? const Color(0xFF7C4DFF).withOpacity(0.5) : _fgDim.withOpacity(0.08), borderRadius: BorderRadius.circular(14)),
+        child: Text(label, style: TextStyle(color: _fg, fontSize: 13, fontWeight: FontWeight.w600)),
+      ),
+    );
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  ROLE SELECTION (unchanged)
+  //  ROLE SELECTION
   // ─────────────────────────────────────────────────────────────────────────────
 
-  Widget _buildRoleSelection() { /* ... unchanged ... */ }
-  Widget _roleCard({required IconData icon, required String label, required Color color, required VoidCallback onTap}) { /* ... unchanged ... */ }
+  Widget _buildRoleSelection() {
+    return Center(
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.wifi_tethering, size: 72, color: _fg.withOpacity(0.9)),
+            const SizedBox(height: 20),
+            Text('Wi-Fi Direct Chat', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800, color: _fg)),
+            const SizedBox(height: 6),
+            Text(_myDisplayName, style: TextStyle(fontSize: 12, color: _fgDim)),
+            const SizedBox(height: 44),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _roleCard(icon: Icons.wifi_tethering_rounded, label: 'HOST', color: const Color(0xFF64D2FF), onTap: _startAsHost),
+                const SizedBox(width: 20),
+                _roleCard(icon: Icons.search_rounded, label: 'JOIN', color: const Color(0xFFFF6FA5), onTap: _startAsClient),
+              ],
+            ),
+            const SizedBox(height: 28),
+            Padding(padding: const EdgeInsets.symmetric(horizontal: 40), child: Text(_status, style: TextStyle(color: _fgFaint, fontSize: 12), textAlign: TextAlign.center)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _roleCard({required IconData icon, required String label, required Color color, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: GlassPanel(
+        borderRadius: BorderRadius.circular(26),
+        tint: color,
+        opacity: 0.22,
+        isDark: _isDark,
+        child: SizedBox(
+          width: 140,
+          height: 160,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 44, color: color),
+              const SizedBox(height: 12),
+              Text(label, style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: color, letterSpacing: 1.2)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  CLIENT HOST LIST (unchanged)
+  //  CLIENT HOST LIST
   // ─────────────────────────────────────────────────────────────────────────────
 
-  Widget _buildClientHostList() { /* ... unchanged ... */ }
+  Widget _buildClientHostList() {
+    if (_discoveredHosts.isEmpty) return _loadingPanel('Scanning for hosts nearby…');
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: _discoveredHosts.length,
+      itemBuilder: (_, i) {
+        final h = _discoveredHosts[i];
+        final name = h?.deviceName?.toString() ?? h?.name?.toString() ?? 'Unknown Host';
+        final address = h?.deviceAddress?.toString() ?? h?.macAddress?.toString() ?? h?.id?.toString() ?? '';
+        return RepaintBoundary(
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: GlassLite(
+              borderRadius: BorderRadius.circular(20),
+              opacity: 0.14,
+              isDark: _isDark,
+              child: ListTile(
+                leading: Icon(Icons.router_rounded, color: _fgDim),
+                title: Text(name, style: TextStyle(color: _fg, fontWeight: FontWeight.w600)),
+                subtitle: Text(address, style: TextStyle(color: _fgFaint, fontSize: 11)),
+                trailing: TextButton(onPressed: () => _connectToHost(h), child: const Text('Connect', style: TextStyle(color: Color(0xFF64D2FF)))),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  CONTACTS LIST (unchanged)
+  //  CONTACTS LIST
   // ─────────────────────────────────────────────────────────────────────────────
 
-  Widget _buildContactsList() { /* ... unchanged ... */ }
+  Widget _buildContactsList() {
+    final contacts = _contactBox.values.toList()..sort((a, b) => b.lastSeen.compareTo(a.lastSeen));
+    final pending = (_groupClients.length - contacts.length).clamp(0, 999);
 
-  Widget _loadingPanel(String label) { /* ... unchanged ... */ }
+    if (contacts.isEmpty) return _loadingPanel(_role == P2pRole.host ? 'Waiting for someone to join…' : 'Connecting…');
+
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: contacts.length + (pending > 0 ? 1 : 0),
+      itemBuilder: (_, i) {
+        if (i == contacts.length) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Center(child: Text('$pending more device(s) connecting…', style: TextStyle(color: _fgFaint, fontSize: 12))),
+          );
+        }
+        final c = contacts[i];
+        final unread = _messages.where((m) => m.contactId == c.uniqueId && !m.isMine && !m.isRead).length;
+        return RepaintBoundary(
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: GlassLite(
+              borderRadius: BorderRadius.circular(20),
+              opacity: 0.14,
+              isDark: _isDark,
+              child: ListTile(
+                leading: CircleAvatar(
+                  backgroundColor: _fgDim.withOpacity(0.2),
+                  backgroundImage: _avatarImage(c.avatarBase64),
+                  child: c.avatarBase64 == null ? Text(c.displayName.isNotEmpty ? c.displayName[0].toUpperCase() : '?', style: TextStyle(color: _fg)) : null,
+                ),
+                title: Text(c.displayName, style: TextStyle(color: _fg, fontWeight: FontWeight.w600)),
+                subtitle: Text(c.isBlocked ? 'Blocked' : (c.rsaPublicKey != null ? 'Encrypted' : 'Connected'), style: TextStyle(color: c.isBlocked ? Colors.redAccent : _fgDim, fontSize: 12)),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (unread > 0)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(color: const Color(0xFF7C4DFF), borderRadius: BorderRadius.circular(12)),
+                        child: Text('$unread', style: const TextStyle(color: Colors.white, fontSize: 11)),
+                      ),
+                    IconButton(icon: Icon(c.isBlocked ? Icons.block : Icons.more_vert, color: _fgDim, size: 20), onPressed: () => _toggleBlockContact(c)),
+                  ],
+                ),
+                onTap: c.isBlocked
+                    ? null
+                    : () {
+                        setState(() => _selectedContact = c);
+                        _markThreadRead(c.uniqueId);
+                      },
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _loadingPanel(String label) {
+    return Center(
+      child: GlassPanel(
+        opacity: 0.16,
+        borderRadius: BorderRadius.circular(24),
+        isDark: _isDark,
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 2.4, color: _fgDim)),
+              const SizedBox(height: 14),
+              Text(label, style: TextStyle(color: _fgDim)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   //  CHAT AREA
@@ -2424,13 +2725,141 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildRecordingOverlay() { /* ... unchanged ... */ }
-  Widget _pulsingDot() { /* ... unchanged ... */ }
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  RECORDING OVERLAY
+  // ─────────────────────────────────────────────────────────────────────────────
 
-  Widget _buildCallOverlay() { /* ... unchanged ... */ }
-  String _callStatusLabel() { /* ... unchanged ... */ }
-  Widget _buildCallControls() { /* ... unchanged ... */ }
-  Widget _callButton({required IconData icon, required Color color, required VoidCallback onTap}) { /* ... unchanged ... */ }
+  Widget _buildRecordingOverlay() {
+    return Positioned(
+      left: 24,
+      right: 24,
+      bottom: 90,
+      child: IgnorePointer(
+        child: TweenAnimationBuilder<double>(
+          tween: Tween(begin: 0, end: 1),
+          duration: const Duration(milliseconds: 200),
+          builder: (context, v, child) => Opacity(opacity: v, child: child),
+          child: GlassPanel(
+            borderRadius: BorderRadius.circular(20),
+            opacity: 0.3,
+            tint: Colors.redAccent,
+            isDark: _isDark,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _pulsingDot(),
+                  const SizedBox(width: 10),
+                  Text('Recording — release to send', style: TextStyle(color: _fg, fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _pulsingDot() {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.4, end: 1),
+      duration: const Duration(milliseconds: 600),
+      curve: Curves.easeInOut,
+      builder: (context, v, _) => Opacity(opacity: v, child: Container(width: 10, height: 10, decoration: const BoxDecoration(color: Colors.redAccent, shape: BoxShape.circle))),
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  CALL OVERLAY
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  Widget _buildCallOverlay() {
+    final peer = _callPeer;
+    return Positioned.fill(
+      child: GlassPanel(
+        borderRadius: BorderRadius.zero,
+        opacity: 0.55,
+        isDark: _isDark,
+        child: SafeArea(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const SizedBox(height: 40),
+              Column(
+                children: [
+                  CircleAvatar(
+                    radius: 54,
+                    backgroundColor: _fgDim.withOpacity(0.2),
+                    backgroundImage: _avatarImage(peer?.avatarBase64),
+                    child: peer?.avatarBase64 == null
+                        ? Text(peer?.displayName.isNotEmpty == true ? peer!.displayName[0].toUpperCase() : '?', style: TextStyle(color: _fg, fontSize: 36))
+                        : null,
+                  ),
+                  const SizedBox(height: 18),
+                  Text(peer?.displayName ?? 'Unknown', style: TextStyle(color: _fg, fontSize: 24, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 8),
+                  Text(_callStatusLabel(), style: TextStyle(color: _fgDim, fontSize: 14)),
+                  if (_callPhase == CallPhase.active) ...[
+                    const SizedBox(height: 4),
+                    Text('Live · ${_callQuality.label}', style: TextStyle(color: _fgFaint, fontSize: 11)),
+                  ],
+                ],
+              ),
+              Padding(padding: const EdgeInsets.only(bottom: 48), child: _buildCallControls()),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _callStatusLabel() {
+    switch (_callPhase) {
+      case CallPhase.outgoingRinging:
+        return 'Ringing…';
+      case CallPhase.incomingRinging:
+        return 'Incoming call…';
+      case CallPhase.active:
+        return 'On call';
+      case CallPhase.idle:
+        return '';
+    }
+  }
+
+  Widget _buildCallControls() {
+    if (_callPhase == CallPhase.incomingRinging) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          _callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: _declineCall),
+          const SizedBox(width: 28),
+          _callButton(icon: Icons.call, color: Colors.greenAccent.shade400, onTap: _acceptCall),
+        ],
+      );
+    }
+    if (_callPhase == CallPhase.outgoingRinging) {
+      return Column(
+        children: [
+          Row(mainAxisAlignment: MainAxisAlignment.center, children: [_callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: () => _endCall())]),
+          const SizedBox(height: 18),
+          TextButton.icon(
+            onPressed: _emergencyForceStart,
+            icon: const Icon(Icons.warning_amber_rounded, color: Colors.orangeAccent, size: 18),
+            label: const Text('Emergency Call (connect without waiting)', style: TextStyle(color: Colors.orangeAccent)),
+          ),
+        ],
+      );
+    }
+    return Row(mainAxisAlignment: MainAxisAlignment.center, children: [_callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: () => _endCall())]);
+  }
+
+  Widget _callButton({required IconData icon, required Color color, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(width: 64, height: 64, decoration: BoxDecoration(shape: BoxShape.circle, color: color), child: Icon(icon, color: Colors.white, size: 28)),
+    );
+  }
 
   // ─────────────────────────────────────────────────────────────────────────────
   //  DISPOSE
