@@ -2043,7 +2043,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: numChannels);
       await FlutterPcmSound.setFeedThreshold((sampleRate * 0.05).round()); // 50ms
       FlutterPcmSound.setFeedCallback(_onPcmFeed);
-      await FlutterPcmSound.play();
+      await FlutterPcmSound.start();
       _pcmSoundReady = true;
     } catch (e) {
       debugPrint('PCM SOUND SETUP ERROR: $e');
@@ -2146,7 +2146,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _pcmFeedBuffer.clear();
 
     try {
-      await FlutterPcmSound.stop(clear: true);
+      await FlutterPcmSound.release();
     } catch (_) {}
 
     try {
@@ -3071,7 +3071,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _audioRecorder.closeRecorder();
     _audioPlayer.closePlayer();
     _callPlayer.closePlayer();
-    FlutterPcmSound.release().catchError((_) {});
     _textController.dispose();
     super.dispose();
   }
