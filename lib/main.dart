@@ -15,6 +15,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter_sound/flutter_sound.dart';
+import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
@@ -637,7 +638,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final FlutterSoundRecorder _audioRecorder = FlutterSoundRecorder();
   final FlutterSoundPlayer _audioPlayer = FlutterSoundPlayer();
-  final FlutterSoundPlayer _callPlayer = FlutterSoundPlayer();
+  final FlutterSoundPlayer _callPlayer = FlutterSoundPlayer(); // legacy, not used for calls
   bool _isRecordingVoiceMessage = false;
   String? _playingMessageId;
 
@@ -655,16 +656,17 @@ class _HomeScreenState extends State<HomeScreen> {
   String _callId = '';
   CallQuality _callQuality = CallQuality.medium;
   CallQuality _activeCallQuality = CallQuality.medium;
-  final List<int> _audioBuffer = [];
-  bool _callPlaybackStarted = false;
   Timer? _ringTimer;
   Timer? _callTimeoutTimer;
   RawDatagramSocket? _callSocket;
   StreamSubscription? _callSocketSub;
   StreamController<Uint8List>? _micStreamController;
   StreamSubscription? _micStreamSub;
-  Timer? _playbackTimer;
   bool _isPlaying = false;
+
+  // flutter_pcm_sound drift-free playback
+  bool _pcmSoundReady = false;
+  final List<int> _pcmFeedBuffer = [];
 
   // Offline detection
   Timer? _heartbeatTimer;
@@ -677,7 +679,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _isTyping = false;
   VoiceEffect _voiceEffect = VoiceEffect.normal;
 
-  // Pending messages (offline queue)
+  // Pending messages
   final Map<String, ChatMessage> _pendingMessages = {};
   Timer? _offlineRetryTimer;
 
@@ -1118,9 +1120,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
   //  TEXT MESSAGES – SEND & RECEIVE
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _sendMessage() async {
     final text = _textController.text.trim();
@@ -1197,9 +1199,6 @@ class _HomeScreenState extends State<HomeScreen> {
       plainText = env.data['text'] as String? ?? '';
     }
 
-    // FIX: always receive as unread; let _markThreadRead handle both local state
-    // and sending the read receipt. If we set isRead=true here, _markThreadRead
-    // sees nothing to do and skips sending the receipt.
     final msg = ChatMessage(
       id: env.id,
       contactId: env.senderId,
@@ -1213,7 +1212,6 @@ class _HomeScreenState extends State<HomeScreen> {
     await _messageBox.put(msg.id, msg);
     _pulseSignal.fire();
 
-    // Send delivery receipt
     final receipt = Envelope(
       type: 'delivery_receipt',
       senderId: _myDeviceId,
@@ -1225,7 +1223,6 @@ class _HomeScreenState extends State<HomeScreen> {
       await _sendEnvelope(receipt);
     } catch (_) {}
 
-    // If we are on this contact's chat screen, mark thread read (updates UI + sends read receipt)
     if (_selectedContact?.uniqueId == env.senderId) await _markThreadRead(env.senderId);
   }
 
@@ -1278,9 +1275,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (_) {}
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
   //  REACTIONS
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
 
   OverlayEntry? _reactionOverlay;
 
@@ -1373,9 +1370,9 @@ class _HomeScreenState extends State<HomeScreen> {
     } catch (_) {}
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
   //  VOICE NOTES
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _startRecordingVoiceMessage() async {
     if (_selectedContact == null || _callPhase != CallPhase.idle) return;
@@ -1511,9 +1508,10 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
   }
-// ═══════════════════════════════════════════════════════════════════════════════
+
+  // ─────────────────────────────────────────────────────────────────────────────
   //  FILE SHARING
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _pickAndSendFile() async {
     if (_selectedContact == null) return;
@@ -1636,9 +1634,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
   //  FILE RECEIVE
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _handleFileNoticeEnvelope(Envelope env) async {
     final fileId = env.data['fileId'] as String?;
@@ -1691,9 +1689,9 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════
-  //  FILE INTERACTION (open/share/save/preview)
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  FILE INTERACTION
+  // ─────────────────────────────────────────────────────────────────────────────
 
   bool _isImageFile(String path) {
     final ext = path.split('.').last.toLowerCase();
@@ -1816,9 +1814,9 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════
-  //  LIVE VOICE CALLS (with jitter buffer)
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  LIVE VOICE CALLS (flutter_pcm_sound for drift-free playback)
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _startCall(Contact peer) async {
     if (_callPhase != CallPhase.idle) return;
@@ -2015,10 +2013,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _activeCallQuality = _callQuality;
     });
   }
-
-  // ═══════════════════════════════════════════════════════════════════════════════
-  //  REALTIME AUDIO – WITH JITTER BUFFER
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  REALTIME AUDIO – flutter_pcm_sound (drift-free callback-based playback)
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _startRealtimeAudio() async {
     final targetIp = _callPeer?.deviceAddress;
@@ -2034,42 +2031,27 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
+    // ── Negotiated audio format ──
     final int sampleRate = _activeCallQuality.sampleRate;
     final int numChannels = _activeCallQuality.numChannels;
-    final int bytesPerFrame = numChannels * 2;
-    const int frameDurationMs = 20;
-    final int frameSize = (sampleRate * frameDurationMs ~/ 1000) * bytesPerFrame;
+    final int bytesPerFrame = numChannels * 2; // PCM 16-bit
 
-    _audioBuffer.clear();
-    _callPlaybackStarted = false;
-    final int targetBytes = frameSize * 10;
-    const int maxBufferMs = 400;
-    final int maxBufferBytes = frameSize * (maxBufferMs ~/ frameDurationMs);
-
+    // ── Setup flutter_pcm_sound (event-based, drift-free) ──
+    _pcmFeedBuffer.clear();
     try {
-      await _callPlayer.startPlayerFromStream(
-        codec: Codec.pcm16,
-        numChannels: numChannels,
-        sampleRate: sampleRate,
-        bufferSize: frameSize * 4,
-        interleaved: true,
-      );
+      await FlutterPcmSound.setLogLevel(LogLevel.error);
+      await FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: numChannels);
+      await FlutterPcmSound.setFeedThreshold((sampleRate * 0.05).round()); // 50ms
+      FlutterPcmSound.setFeedCallback(_onPcmFeed);
+      await FlutterPcmSound.play();
+      _pcmSoundReady = true;
     } catch (e) {
-      debugPrint('CALL PLAYER START ERROR: $e — retrying at safe mono 16kHz');
-      try {
-        await _callPlayer.startPlayerFromStream(
-          codec: Codec.pcm16,
-          numChannels: 1,
-          sampleRate: 16000,
-          bufferSize: 640,
-          interleaved: true,
-        );
-      } catch (e2) {
-        _endCall(reason: 'This device could not start live call playback: $e2');
-        return;
-      }
+      debugPrint('PCM SOUND SETUP ERROR: $e');
+      _endCall(reason: 'Could not start PCM audio output: $e');
+      return;
     }
 
+    // ── Microphone → UDP (flutter_sound for recording) ──
     _micStreamController = StreamController<Uint8List>();
     _micStreamSub = _micStreamController!.stream.listen((data) {
       final ip = _callPeer?.deviceAddress;
@@ -2085,7 +2067,7 @@ class _HomeScreenState extends State<HomeScreen> {
         codec: Codec.pcm16,
         numChannels: numChannels,
         sampleRate: sampleRate,
-        bufferSize: frameSize * 2,
+        bufferSize: 8192,
       );
     } catch (e) {
       debugPrint('CALL MIC START ERROR: $e — retrying at safe mono 16kHz');
@@ -2095,63 +2077,86 @@ class _HomeScreenState extends State<HomeScreen> {
           codec: Codec.pcm16,
           numChannels: 1,
           sampleRate: 16000,
-          bufferSize: 640,
+          bufferSize: 8192,
         );
       } catch (e2) {
         _endCall(reason: 'This device could not start the microphone stream: $e2');
+        return;
       }
     }
 
+    // ── UDP → flutter_pcm_sound buffer ──
     _isPlaying = true;
     _callSocketSub = _callSocket!.listen((event) {
       if (event != RawSocketEvent.read) return;
       final dg = _callSocket!.receive();
       if (dg == null || dg.data.isEmpty) return;
 
-      _audioBuffer.addAll(dg.data);
+      _pcmFeedBuffer.addAll(dg.data);
 
-      if (_audioBuffer.length > maxBufferBytes) {
-        final drop = _audioBuffer.length - maxBufferBytes;
-        _audioBuffer.removeRange(0, drop);
-      }
-
-      if (!_callPlaybackStarted && _audioBuffer.length >= targetBytes) {
-        _callPlaybackStarted = true;
-        _startPlaybackTimer(frameSize, frameDurationMs);
+      // Prevent memory bloat: cap at ~500ms
+      final maxBytes = (sampleRate * bytesPerFrame * 0.5).round();
+      if (_pcmFeedBuffer.length > maxBytes) {
+        _pcmFeedBuffer.removeRange(0, _pcmFeedBuffer.length - maxBytes);
       }
     });
   }
 
-  void _startPlaybackTimer(int frameSize, int frameDurationMs) {
-    _playbackTimer?.cancel();
-    _playbackTimer = Timer.periodic(Duration(milliseconds: frameDurationMs), (timer) {
-      if (!_isPlaying || _callPhase != CallPhase.active) {
-        timer.cancel();
-        return;
-      }
+  void _onPcmFeed(int remainingFrames) async {
+    if (!_isPlaying || _callPhase != CallPhase.active) return;
 
-      if (_audioBuffer.length >= frameSize) {
-        final frame = Uint8List.fromList(_audioBuffer.sublist(0, frameSize));
-        _callPlayer.uint8ListSink?.add(frame);
-        _audioBuffer.removeRange(0, frameSize);
-      } else {
-        _callPlayer.uint8ListSink?.add(Uint8List(frameSize));
+    final int bytesPerFrame = _activeCallQuality.numChannels * 2;
+    final int bytesNeeded = remainingFrames * bytesPerFrame;
+
+    if (_pcmFeedBuffer.length >= bytesNeeded && bytesNeeded > 0) {
+      final chunk = Uint8List.fromList(_pcmFeedBuffer.sublist(0, bytesNeeded));
+      _pcmFeedBuffer.removeRange(0, bytesNeeded);
+      try {
+        await FlutterPcmSound.feed(PcmArrayInt16.fromList(chunk));
+      } catch (e) {
+        debugPrint('PCM FEED ERROR: $e');
       }
-    });
+    } else if (_pcmFeedBuffer.isNotEmpty) {
+      final haveBytes = _pcmFeedBuffer.length;
+      final silenceBytes = bytesNeeded - haveBytes;
+      final chunk = Uint8List(bytesNeeded);
+      if (haveBytes > 0) {
+        chunk.setRange(0, haveBytes, Uint8List.fromList(_pcmFeedBuffer));
+        _pcmFeedBuffer.clear();
+      }
+      try {
+        await FlutterPcmSound.feed(PcmArrayInt16.fromList(chunk));
+      } catch (e) {
+        debugPrint('PCM FEED ERROR: $e');
+      }
+    } else {
+      if (bytesNeeded > 0) {
+        try {
+          await FlutterPcmSound.feed(PcmArrayInt16.fromList(Uint8List(bytesNeeded)));
+        } catch (e) {
+          debugPrint('PCM SILENCE FEED ERROR: $e');
+        }
+      }
+    }
   }
 
   Future<void> _stopRealtimeAudio() async {
     _isPlaying = false;
-    _callPlaybackStarted = false;
-    _playbackTimer?.cancel();
-    _playbackTimer = null;
-    _audioBuffer.clear();
+    _pcmSoundReady = false;
+    _pcmFeedBuffer.clear();
+
+    try {
+      await FlutterPcmSound.stop(clear: true);
+    } catch (_) {}
+
     try {
       await _audioRecorder.stopRecorder();
     } catch (_) {}
+
     try {
       await _callPlayer.stopPlayer();
     } catch (_) {}
+
     await _micStreamSub?.cancel();
     _micStreamSub = null;
     await _micStreamController?.close();
@@ -2162,9 +2167,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _callSocket = null;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
   //  BLOCKING / MISC
-  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _toggleBlockContact(Contact c) async {
     c.isBlocked = !c.isBlocked;
@@ -2293,7 +2298,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  //  TOP BAR (with offline status and typing)
+  //  TOP BAR
   // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildTopBar() {
@@ -2698,7 +2703,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  //  MESSAGE BUBBLE (with status icons)
+  //  MESSAGE BUBBLE
   // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildMessageBubble(ChatMessage msg) {
@@ -2821,7 +2826,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  //  COMPOSER (with typing detection and voice FX toggle)
+  //  COMPOSER (with voice FX toggle)
   // ═══════════════════════════════════════════════════════════════════════════════
 
   Widget _buildComposer() {
@@ -3066,6 +3071,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _audioRecorder.closeRecorder();
     _audioPlayer.closePlayer();
     _callPlayer.closePlayer();
+    FlutterPcmSound.release().catchError((_) {});
     _textController.dispose();
     super.dispose();
   }
@@ -3076,4 +3082,3 @@ class CancelToken {
   void cancel() => _cancelled = true;
   bool get isCancelled => _cancelled;
 }
-     
