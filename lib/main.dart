@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:convert';
+import 'dart:convert' hide Codec;
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
