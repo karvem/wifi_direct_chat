@@ -663,6 +663,8 @@ class _HomeScreenState extends State<HomeScreen> {
   StreamController<Uint8List>? _micStreamController;
   StreamSubscription? _micStreamSub;
   bool _isPlaying = false;
+  int _dbgMicPacketsSent = 0;
+  int _dbgUdpPacketsRecv = 0;
 
   // flutter_pcm_sound drift-free playback
   bool _pcmSoundReady = false;
@@ -2023,8 +2025,12 @@ class _HomeScreenState extends State<HomeScreen> {
       _endCall(reason: "Missing peer network address — can't start audio");
       return;
     }
+    debugPrint('CALL AUDIO: targetIp=$targetIp port=$kCallPort');
+    _dbgMicPacketsSent = 0;
+    _dbgUdpPacketsRecv = 0;
     try {
       _callSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, kCallPort, reuseAddress: true);
+      debugPrint('CALL AUDIO: socket bound on ${_callSocket!.address.address}:${_callSocket!.port}');
     } catch (e) {
       debugPrint('CALL SOCKET BIND ERROR: $e');
       _endCall(reason: 'Could not open the call audio socket: $e');
@@ -2059,7 +2065,13 @@ class _HomeScreenState extends State<HomeScreen> {
       if (ip == null || _callSocket == null) return;
       try {
         _callSocket!.send(data, InternetAddress(ip), kCallPort);
-      } catch (_) {}
+        _dbgMicPacketsSent++;
+        if (_dbgMicPacketsSent == 1 || _dbgMicPacketsSent % 40 == 0) {
+          debugPrint('CALL AUDIO: mic->UDP sent packet #$_dbgMicPacketsSent (${data.length} bytes) to $ip:$kCallPort');
+        }
+      } catch (e) {
+        debugPrint('CALL AUDIO: mic send FAILED: $e');
+      }
     });
 
     try {
@@ -2070,6 +2082,7 @@ class _HomeScreenState extends State<HomeScreen> {
         sampleRate: sampleRate,
         bufferSize: 8192,
       );
+      debugPrint('CALL AUDIO: mic recorder started ($sampleRate Hz, $numChannels ch)');
     } catch (e) {
       debugPrint('CALL MIC START ERROR: $e — retrying at safe mono 16kHz');
       try {
@@ -2092,12 +2105,20 @@ class _HomeScreenState extends State<HomeScreen> {
       final dg = _callSocket!.receive();
       if (dg == null || dg.data.isEmpty) return;
 
+      _dbgUdpPacketsRecv++;
+      if (_dbgUdpPacketsRecv == 1 || _dbgUdpPacketsRecv % 40 == 0) {
+        debugPrint('CALL AUDIO: UDP<-network recv packet #$_dbgUdpPacketsRecv (${dg.data.length} bytes) from ${dg.address.address}:${dg.port}, buffer now ${_pcmFeedBuffer.length} bytes');
+      }
+
       _pcmFeedBuffer.addAll(dg.data);
 
-      // Prevent memory bloat: cap at ~500ms
+      // Prevent memory bloat: cap at ~500ms (trim amount rounded down to a
+      // whole number of frames so we never split a 16-bit sample in half)
       final maxBytes = (sampleRate * bytesPerFrame * 0.5).round();
       if (_pcmFeedBuffer.length > maxBytes) {
-        _pcmFeedBuffer.removeRange(0, _pcmFeedBuffer.length - maxBytes);
+        int trim = _pcmFeedBuffer.length - maxBytes;
+        trim -= trim % bytesPerFrame;
+        if (trim > 0) _pcmFeedBuffer.removeRange(0, trim);
       }
     });
   }
@@ -2116,7 +2137,13 @@ class _HomeScreenState extends State<HomeScreen> {
     return samples;
   }
 
+  int _dbgFeedCalls = 0;
+
   void _onPcmFeed(int remainingFrames) async {
+    _dbgFeedCalls++;
+    if (_dbgFeedCalls == 1 || _dbgFeedCalls % 40 == 0) {
+      debugPrint('CALL AUDIO: _onPcmFeed called #$_dbgFeedCalls remainingFrames=$remainingFrames isPlaying=$_isPlaying phase=$_callPhase bufferedBytes=${_pcmFeedBuffer.length}');
+    }
     if (!_isPlaying || _callPhase != CallPhase.active) return;
 
     final int bytesPerFrame = _activeCallQuality.numChannels * 2;
