@@ -9,22 +9,22 @@ dependencies:
   flutter:
     sdk: flutter
     
-  flutter_webrtc: ^1.5.2   # check pub.dev for the current version
+  flutter_webrtc: ^1.5.2
   flutter_pcm_sound: ^3.3.2
   open_file: ^3.3.2
-  share_plus: ^7.2.1
-  cross_file: ^0.3.4  # already used by share_plus, but add explicitly
+  share_plus: ^13.1.0          # ✅ Verified latest
+  cross_file: ^0.3.4
   flutter_p2p_connection: ^3.0.3
-  permission_handler: ^11.4.0
+  permission_handler: ^12.0.1  # ✅ Verified latest
   file_picker: ^10.2.0
   path_provider: ^2.1.0
   encryptify: ^0.0.4
-  flutter_secure_storage: ^9.0.0
+  flutter_secure_storage: ^10.3.1  # ✅ Verified latest
   hive: ^2.2.0
   hive_flutter: ^1.1.0
   uuid: ^4.0.0
-  flutter_sound: ^9.2.13
-  device_info_plus: ^11.5.0
+  flutter_sound: ^9.30.0       # ✅ Verified latest
+  device_info_plus: ^13.2.0    # ✅ Verified latest
 
 dev_dependencies:
   flutter_test:
