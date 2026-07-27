@@ -9,22 +9,22 @@ dependencies:
   flutter:
     sdk: flutter
     
-  flutter_webrtc: ^1.5.2
-  flutter_pcm_sound: ^3.3.2
-  open_file: ^3.3.2
-  share_plus: ^13.1.0          # ✅ Verified latest
+  flutter_webrtc: ^1.5.2          # ✅ Verified - AGP 9 compatible
+  flutter_pcm_sound: ^3.3.3       # ⬆️ Updated
+  open_file: ^3.5.11              # ⬆️ Updated
+  share_plus: ^13.1.0             # ⬆️ Updated - AGP 9 compatible
   cross_file: ^0.3.4
-  flutter_p2p_connection: ^3.0.3
-  permission_handler: ^12.0.1  # ✅ Verified latest
-  file_picker: ^10.2.0
-  path_provider: ^2.1.0
-  encryptify: ^0.0.4
-  flutter_secure_storage: ^10.3.1  # ✅ Verified latest
-  hive: ^2.2.0
+  flutter_p2p_connection: ^3.0.3  # ⚠️ Keep as-is (no newer version)
+  permission_handler: ^12.0.1     # ⬆️ Updated - AGP 9 compatible
+  file_picker: ^10.2.0            # ⚠️ Keep stable (beta available)
+  path_provider: ^2.1.6           # ⬆️ Updated
+  encryptify: ^0.0.4              # ⚠️ Keep as-is (no newer version)
+  flutter_secure_storage: ^10.3.1 # ⬆️ Updated - AGP 9 compatible
+  hive: ^2.2.3                    # ⬆️ Updated
   hive_flutter: ^1.1.0
-  uuid: ^4.0.0
-  flutter_sound: ^9.30.0       # ✅ Verified latest
-  device_info_plus: ^13.2.0    # ✅ Verified latest
+  uuid: ^4.5.1                    # ⬆️ Updated
+  flutter_sound: ^9.30.0          # ⬆️ Updated
+  device_info_plus: ^13.2.0       # ⬆️ Updated - AGP 9 compatible
 
 dev_dependencies:
   flutter_test:
