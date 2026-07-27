@@ -15,7 +15,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter_sound/flutter_sound.dart';
-import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
@@ -327,24 +327,6 @@ class LanIp {
 //  SETTINGS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-enum CallQuality { low, medium, high, stereoHd }
-
-extension CallQualityX on CallQuality {
-  String get label => switch (this) {
-        CallQuality.low => 'Low · 16kHz mono',
-        CallQuality.medium => 'Medium · 24kHz mono',
-        CallQuality.high => 'High · 44.1kHz mono',
-        CallQuality.stereoHd => 'Stereo HD · 48kHz stereo',
-      };
-  int get sampleRate => switch (this) {
-        CallQuality.low => 16000,
-        CallQuality.medium => 24000,
-        CallQuality.high => 44100,
-        CallQuality.stereoHd => 48000,
-      };
-  int get numChannels => this == CallQuality.stereoHd ? 2 : 1;
-}
-
 enum VoiceEffect { normal, minion, slowMo }
 
 const List<List<Color>> kPalettes = [
@@ -370,13 +352,6 @@ class SettingsService {
   static Future<void> setPaletteIndex(int i) => _storage.write(key: 'palette', value: i.toString());
   static Future<String?> getAvatar() => _storage.read(key: 'avatar_b64');
   static Future<void> setAvatar(String b64) => _storage.write(key: 'avatar_b64', value: b64);
-
-  static Future<CallQuality> getCallQuality() async {
-    final v = await _storage.read(key: 'call_quality');
-    return CallQuality.values.firstWhere((q) => q.name == v, orElse: () => CallQuality.medium);
-  }
-
-  static Future<void> setCallQuality(CallQuality q) => _storage.write(key: 'call_quality', value: q.name);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -600,7 +575,6 @@ class _AnimatedMeshBackgroundState extends State<_AnimatedMeshBackground> with S
 
 enum P2pRole { none, host, client }
 enum CallPhase { idle, outgoingRinging, incomingRinging, active }
-const int kCallPort = 45820;
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -638,7 +612,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final FlutterSoundRecorder _audioRecorder = FlutterSoundRecorder();
   final FlutterSoundPlayer _audioPlayer = FlutterSoundPlayer();
-  final FlutterSoundPlayer _callPlayer = FlutterSoundPlayer(); // legacy, not used for calls
   bool _isRecordingVoiceMessage = false;
   String? _playingMessageId;
 
@@ -650,25 +623,29 @@ class _HomeScreenState extends State<HomeScreen> {
   Color get _fgDim => _isDark ? Colors.white54 : Colors.black45;
   Color get _fgFaint => _isDark ? Colors.white38 : Colors.black38;
 
-  // Call state
+  // Call state (WebRTC)
   CallPhase _callPhase = CallPhase.idle;
   Contact? _callPeer;
   String _callId = '';
-  CallQuality _callQuality = CallQuality.medium;
-  CallQuality _activeCallQuality = CallQuality.medium;
+  bool _iAmCaller = false; // I sent the call_invite (relevant for future glare-handling)
   Timer? _ringTimer;
   Timer? _callTimeoutTimer;
-  RawDatagramSocket? _callSocket;
-  StreamSubscription? _callSocketSub;
-  StreamController<Uint8List>? _micStreamController;
-  StreamSubscription? _micStreamSub;
-  bool _isPlaying = false;
-  int _dbgMicPacketsSent = 0;
-  int _dbgUdpPacketsRecv = 0;
 
-  // flutter_pcm_sound drift-free playback
-  bool _pcmSoundReady = false;
-  final List<int> _pcmFeedBuffer = [];
+  RTCPeerConnection? _peerConnection;
+  MediaStream? _localAudioStream; // mic, present for the whole call
+  MediaStreamTrack? _localVideoTrack; // camera, only present while video is on
+  RTCRtpSender? _videoSender; // sender for the pre-negotiated (always-present) video transceiver
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+  MediaStream? _remoteDisplayStream; // used only when a remote track arrives with no associated MediaStream
+  bool _renderersReady = false;
+  final List<RTCIceCandidate> _pendingRemoteIce = [];
+  bool _remoteDescriptionSet = false;
+
+  bool _micMuted = false;
+  bool _localVideoOn = false;
+  bool _remoteVideoOn = false;
+  bool _usingFrontCamera = true;
 
   // Offline detection
   Timer? _heartbeatTimer;
@@ -722,11 +699,13 @@ class _HomeScreenState extends State<HomeScreen> {
     _myAvatarBase64 = await SettingsService.getAvatar();
     _isDark = await SettingsService.getIsDark();
     _paletteIndex = await SettingsService.getPaletteIndex();
-    _callQuality = await SettingsService.getCallQuality();
 
     await _audioRecorder.openRecorder();
     await _audioPlayer.openPlayer();
-    await _callPlayer.openPlayer();
+
+    await _localRenderer.initialize();
+    await _remoteRenderer.initialize();
+    _renderersReady = true;
 
     await _host.initialize();
     await _client.initialize();
@@ -736,6 +715,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _requestPermissions() async {
     await Permission.microphone.request();
+    await Permission.camera.request();
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1118,6 +1098,15 @@ class _HomeScreenState extends State<HomeScreen> {
         break;
       case 'call_force_start':
         _handleCallForceStart(env);
+        break;
+      case 'call_sdp':
+        _handleSdpEnvelope(env);
+        break;
+      case 'call_ice':
+        _handleIceEnvelope(env);
+        break;
+      case 'call_video_state':
+        _handleVideoStateEnvelope(env);
         break;
     }
   }
@@ -1817,7 +1806,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
-  //  LIVE VOICE CALLS (flutter_pcm_sound for drift-free playback)
+  //  LIVE VOICE / VIDEO CALLS (WebRTC)
   // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _startCall(Contact peer) async {
@@ -1836,18 +1825,14 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     _callPeer = peer;
     _callId = const Uuid().v4();
-    _activeCallQuality = _callQuality;
+    _iAmCaller = true;
     setState(() => _callPhase = CallPhase.outgoingRinging);
     final env = Envelope(
       type: 'call_invite',
       senderId: _myDeviceId,
       senderName: _myDisplayName,
       to: peer.uniqueId,
-      data: {
-        'callId': _callId,
-        'sampleRate': _activeCallQuality.sampleRate,
-        'numChannels': _activeCallQuality.numChannels,
-      },
+      data: {'callId': _callId},
     );
     try {
       await _sendEnvelope(env);
@@ -1878,15 +1863,9 @@ class _HomeScreenState extends State<HomeScreen> {
     final contact = _contactBox.get(env.senderId);
     if (contact == null) return;
 
-    final sampleRate = env.data['sampleRate'] as int? ?? CallQuality.medium.sampleRate;
-    final numChannels = env.data['numChannels'] as int? ?? CallQuality.medium.numChannels;
-    _activeCallQuality = CallQuality.values.firstWhere(
-      (q) => q.sampleRate == sampleRate && q.numChannels == numChannels,
-      orElse: () => CallQuality.medium,
-    );
-
     _callPeer = contact;
     _callId = env.data['callId'] as String? ?? const Uuid().v4();
+    _iAmCaller = false;
     setState(() => _callPhase = CallPhase.incomingRinging);
     _ringTimer?.cancel();
     _ringTimer = Timer.periodic(const Duration(milliseconds: 1400), (_) => HapticFeedback.heavyImpact());
@@ -1900,22 +1879,24 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_callPhase != CallPhase.incomingRinging || _callPeer == null) return;
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
+    setState(() => _callPhase = CallPhase.active);
+    try {
+      await _createPeerConnection();
+    } catch (e) {
+      debugPrint('CALL WEBRTC: setup error: $e');
+      _endCall(reason: 'Could not start the call: $e');
+      return;
+    }
     final env = Envelope(
       type: 'call_accept',
       senderId: _myDeviceId,
       senderName: _myDisplayName,
       to: _callPeer!.uniqueId,
-      data: {
-        'callId': _callId,
-        'sampleRate': _activeCallQuality.sampleRate,
-        'numChannels': _activeCallQuality.numChannels,
-      },
+      data: {'callId': _callId},
     );
-    setState(() => _callPhase = CallPhase.active);
     try {
       await _sendEnvelope(env);
     } catch (_) {}
-    await _startRealtimeAudio();
   }
 
   Future<void> _declineCall() async {
@@ -1929,19 +1910,90 @@ class _HomeScreenState extends State<HomeScreen> {
     _endCallLocal();
   }
 
+  // Caller side: peer just accepted, so now WE create the peer connection and
+  // the initial SDP offer (the callee already set up their peer connection
+  // in _acceptCall, so it's guaranteed to be ready to receive it).
   Future<void> _handleCallAccept(Envelope env) async {
     if (_callPhase != CallPhase.outgoingRinging || env.data['callId'] != _callId) return;
     _callTimeoutTimer?.cancel();
-
-    final sampleRate = env.data['sampleRate'] as int? ?? _callQuality.sampleRate;
-    final numChannels = env.data['numChannels'] as int? ?? _callQuality.numChannels;
-    _activeCallQuality = CallQuality.values.firstWhere(
-      (q) => q.sampleRate == sampleRate && q.numChannels == numChannels,
-      orElse: () => _callQuality,
-    );
-
     setState(() => _callPhase = CallPhase.active);
-    await _startRealtimeAudio();
+    try {
+      await _createPeerConnection();
+      final offer = await _peerConnection!.createOffer();
+      await _peerConnection!.setLocalDescription(offer);
+      final sdpEnv = Envelope(
+        type: 'call_sdp',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: _callPeer!.uniqueId,
+        data: {'callId': _callId, 'sdpType': 'offer', 'sdp': offer.sdp},
+      );
+      await _sendEnvelope(sdpEnv);
+    } catch (e) {
+      debugPrint('CALL WEBRTC: offer error: $e');
+      _endCall(reason: 'Could not start the call: $e');
+    }
+  }
+
+  Future<void> _handleSdpEnvelope(Envelope env) async {
+    if (env.data['callId'] != _callId || _peerConnection == null) return;
+    final sdpType = env.data['sdpType'] as String?;
+    final sdp = env.data['sdp'] as String?;
+    if (sdp == null || sdpType == null) return;
+    try {
+      await _peerConnection!.setRemoteDescription(RTCSessionDescription(sdp, sdpType));
+      _remoteDescriptionSet = true;
+      for (final c in _pendingRemoteIce) {
+        try {
+          await _peerConnection!.addCandidate(c);
+        } catch (e) {
+          debugPrint('CALL WEBRTC: queued addCandidate error: $e');
+        }
+      }
+      _pendingRemoteIce.clear();
+
+      if (sdpType == 'offer') {
+        final answer = await _peerConnection!.createAnswer();
+        await _peerConnection!.setLocalDescription(answer);
+        final answerEnv = Envelope(
+          type: 'call_sdp',
+          senderId: _myDeviceId,
+          senderName: _myDisplayName,
+          to: env.senderId,
+          data: {'callId': _callId, 'sdpType': 'answer', 'sdp': answer.sdp},
+        );
+        await _sendEnvelope(answerEnv);
+      }
+    } catch (e) {
+      debugPrint('CALL WEBRTC: SDP handling error: $e');
+    }
+  }
+
+  Future<void> _handleIceEnvelope(Envelope env) async {
+    if (env.data['callId'] != _callId || _peerConnection == null) return;
+    final candidate = env.data['candidate'] as String?;
+    if (candidate == null) return;
+    final ice = RTCIceCandidate(candidate, env.data['sdpMid'] as String?, env.data['sdpMLineIndex'] as int?);
+    if (_remoteDescriptionSet) {
+      try {
+        await _peerConnection!.addCandidate(ice);
+      } catch (e) {
+        debugPrint('CALL WEBRTC: addCandidate error: $e');
+      }
+    } else {
+      _pendingRemoteIce.add(ice);
+    }
+  }
+
+  void _handleVideoStateEnvelope(Envelope env) {
+    if (env.data['callId'] != _callId) return;
+    final on = env.data['video'] == true;
+    // Deliberately NOT touching _remoteRenderer.srcObject here: onTrack only
+    // fires once for this transceiver (it's never re-added), so later camera
+    // toggles from the peer are just replaceTrack() calls that don't refire
+    // onTrack. The renderer keeps its stream for the whole call; the
+    // _remoteVideoOn flag alone controls whether the video widget is shown.
+    if (mounted) setState(() => _remoteVideoOn = on);
   }
 
   void _handleCallReject(Envelope env) {
@@ -1956,41 +2008,63 @@ class _HomeScreenState extends State<HomeScreen> {
     _endCallLocal();
   }
 
+  // Bypass path: caller gives up waiting for call_accept and pushes an offer
+  // through directly. Handles both "callee hasn't tapped accept yet" and
+  // "callee never even got the original invite" by re-deriving _callPeer.
   Future<void> _handleCallForceStart(Envelope env) async {
-    if (env.data['callId'] != _callId) return;
+    final incomingCallId = env.data['callId'] as String?;
+    if (_callId.isNotEmpty && incomingCallId != null && incomingCallId != _callId) return;
+
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
 
-    final sampleRate = env.data['sampleRate'] as int? ?? _callQuality.sampleRate;
-    final numChannels = env.data['numChannels'] as int? ?? _callQuality.numChannels;
-    _activeCallQuality = CallQuality.values.firstWhere(
-      (q) => q.sampleRate == sampleRate && q.numChannels == numChannels,
-      orElse: () => _callQuality,
-    );
+    if (_callPeer == null) {
+      final contact = _contactBox.get(env.senderId);
+      if (contact == null) return;
+      _callPeer = contact;
+      _callId = incomingCallId ?? const Uuid().v4();
+      _iAmCaller = false;
+    }
 
     setState(() => _callPhase = CallPhase.active);
-    await _startRealtimeAudio();
+    try {
+      await _createPeerConnection();
+    } catch (e) {
+      _endCall(reason: 'Could not start the call: $e');
+      return;
+    }
+
+    final sdp = env.data['sdp'] as String?;
+    if (sdp != null) {
+      await _handleSdpEnvelope(Envelope(
+        type: 'call_sdp',
+        senderId: env.senderId,
+        senderName: env.senderName,
+        to: _myDeviceId,
+        data: {'callId': _callId, 'sdpType': 'offer', 'sdp': sdp},
+      ));
+    }
   }
 
   Future<void> _emergencyForceStart() async {
     if (_callPhase != CallPhase.outgoingRinging || _callPeer == null) return;
     _callTimeoutTimer?.cancel();
-    final env = Envelope(
-      type: 'call_force_start',
-      senderId: _myDeviceId,
-      senderName: _myDisplayName,
-      to: _callPeer!.uniqueId,
-      data: {
-        'callId': _callId,
-        'sampleRate': _activeCallQuality.sampleRate,
-        'numChannels': _activeCallQuality.numChannels,
-      },
-    );
     setState(() => _callPhase = CallPhase.active);
     try {
+      await _createPeerConnection();
+      final offer = await _peerConnection!.createOffer();
+      await _peerConnection!.setLocalDescription(offer);
+      final env = Envelope(
+        type: 'call_force_start',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: _callPeer!.uniqueId,
+        data: {'callId': _callId, 'sdp': offer.sdp},
+      );
       await _sendEnvelope(env);
-    } catch (_) {}
-    await _startRealtimeAudio();
+    } catch (e) {
+      _endCall(reason: 'Could not start the call: $e');
+    }
   }
 
   Future<void> _endCall({String? reason}) async {
@@ -2007,204 +2081,211 @@ class _HomeScreenState extends State<HomeScreen> {
   void _endCallLocal() {
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
-    _stopRealtimeAudio();
+    _teardownWebRTC();
     setState(() {
       _callPhase = CallPhase.idle;
       _callPeer = null;
       _callId = '';
-      _activeCallQuality = _callQuality;
+      _iAmCaller = false;
+      _micMuted = false;
+      _localVideoOn = false;
+      _remoteVideoOn = false;
     });
   }
+
   // ─────────────────────────────────────────────────────────────────────────────
-  //  REALTIME AUDIO – flutter_pcm_sound (drift-free callback-based playback)
+  //  WEBRTC PLUMBING
   // ─────────────────────────────────────────────────────────────────────────────
 
-  Future<void> _startRealtimeAudio() async {
-    final targetIp = _callPeer?.deviceAddress;
-    if (targetIp == null) {
-      _endCall(reason: "Missing peer network address — can't start audio");
-      return;
-    }
-    debugPrint('CALL AUDIO: targetIp=$targetIp port=$kCallPort');
-    _dbgMicPacketsSent = 0;
-    _dbgUdpPacketsRecv = 0;
-    try {
-      _callSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, kCallPort, reuseAddress: true);
-      debugPrint('CALL AUDIO: socket bound on ${_callSocket!.address.address}:${_callSocket!.port}');
-    } catch (e) {
-      debugPrint('CALL SOCKET BIND ERROR: $e');
-      _endCall(reason: 'Could not open the call audio socket: $e');
-      return;
-    }
+  Future<void> _createPeerConnection() async {
+    // No STUN/TURN: the Wi-Fi Direct group typically has no internet path
+    // anyway, and both peers are already on the same local subnet, so plain
+    // host ICE candidates are all that's needed to connect directly.
+    final config = <String, dynamic>{'iceServers': <Map<String, dynamic>>[]};
+    final constraints = <String, dynamic>{
+      'mandatory': {},
+      'optional': [
+        {'DtlsSrtpKeyAgreement': true},
+      ],
+    };
 
-    // ── Negotiated audio format ──
-    final int sampleRate = _activeCallQuality.sampleRate;
-    final int numChannels = _activeCallQuality.numChannels;
-    final int bytesPerFrame = numChannels * 2; // PCM 16-bit
+    final pc = await createPeerConnection(config, constraints);
 
-    // ── Setup flutter_pcm_sound (event-based, drift-free) ──
-    _pcmFeedBuffer.clear();
-    try {
-      await FlutterPcmSound.setLogLevel(LogLevel.error);
-      await FlutterPcmSound.setup(sampleRate: sampleRate, channelCount: numChannels);
-      await FlutterPcmSound.setFeedThreshold((sampleRate * 0.05).round()); // 50ms
-      FlutterPcmSound.setFeedCallback(_onPcmFeed);
-      _isPlaying = true; // must be true BEFORE start(), which fires the first feed event immediately
-      await FlutterPcmSound.start();
-      _pcmSoundReady = true;
-    } catch (e) {
-      debugPrint('PCM SOUND SETUP ERROR: $e');
-      _endCall(reason: 'Could not start PCM audio output: $e');
-      return;
-    }
-
-    // ── Microphone → UDP (flutter_sound for recording) ──
-    _micStreamController = StreamController<Uint8List>();
-    _micStreamSub = _micStreamController!.stream.listen((data) {
-      final ip = _callPeer?.deviceAddress;
-      if (ip == null || _callSocket == null) return;
-      try {
-        _callSocket!.send(data, InternetAddress(ip), kCallPort);
-        _dbgMicPacketsSent++;
-        if (_dbgMicPacketsSent == 1 || _dbgMicPacketsSent % 40 == 0) {
-          debugPrint('CALL AUDIO: mic->UDP sent packet #$_dbgMicPacketsSent (${data.length} bytes) to $ip:$kCallPort');
-        }
-      } catch (e) {
-        debugPrint('CALL AUDIO: mic send FAILED: $e');
-      }
-    });
-
-    try {
-      await _audioRecorder.startRecorder(
-        toStream: _micStreamController!.sink,
-        codec: Codec.pcm16,
-        numChannels: numChannels,
-        sampleRate: sampleRate,
-        bufferSize: 8192,
+    pc.onIceCandidate = (RTCIceCandidate? candidate) {
+      if (candidate == null || candidate.candidate == null || _callPeer == null) return;
+      final env = Envelope(
+        type: 'call_ice',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: _callPeer!.uniqueId,
+        data: {
+          'callId': _callId,
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+        },
       );
-      debugPrint('CALL AUDIO: mic recorder started ($sampleRate Hz, $numChannels ch)');
-    } catch (e) {
-      debugPrint('CALL MIC START ERROR: $e — retrying at safe mono 16kHz');
+      _sendEnvelope(env).catchError((_) {});
+    };
+
+    pc.onTrack = (RTCTrackEvent event) async {
+      debugPrint('CALL WEBRTC: onTrack kind=${event.track.kind} streams=${event.streams.length}');
+      if (event.track.kind != 'video') return;
+      // Because the video transceiver is created up front with no track
+      // attached (so camera toggling never needs renegotiation), the track
+      // that eventually arrives here can show up with an EMPTY event.streams
+      // list — there's no MediaStream to hand the renderer. Prefer a real
+      // stream if one is present, otherwise build one ourselves and drop the
+      // track into it so the renderer always has something to bind to.
+      if (event.streams.isNotEmpty) {
+        _remoteRenderer.srcObject = event.streams[0];
+      } else {
+        _remoteDisplayStream ??= await createLocalMediaStream('remote_display');
+        try {
+          await _remoteDisplayStream!.addTrack(event.track);
+        } catch (e) {
+          debugPrint('CALL WEBRTC: could not attach stream-less track: $e');
+        }
+        _remoteRenderer.srcObject = _remoteDisplayStream;
+      }
+      if (mounted) setState(() {});
+      // Remote audio plays through the default output automatically once
+      // it's attached to the connection — nothing else to wire up.
+    };
+
+    pc.onConnectionState = (RTCPeerConnectionState state) {
+      debugPrint('CALL WEBRTC: connection state = $state');
+    };
+
+    _peerConnection = pc;
+    _remoteDescriptionSet = false;
+    _pendingRemoteIce.clear();
+    _remoteDisplayStream = null;
+
+    _localAudioStream = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+    for (final track in _localAudioStream!.getAudioTracks()) {
+      track.enabled = !_micMuted;
+      await pc.addTrack(track, _localAudioStream!);
+    }
+
+    // Pre-negotiate a bidirectional video slot with no track attached yet,
+    // so enabling/disabling the camera later never needs a renegotiation
+    // round-trip — it's just a local replaceTrack() call.
+    final videoTransceiver = await pc.addTransceiver(
+      kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+      init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
+    );
+    _videoSender = videoTransceiver.sender;
+  }
+
+  Future<void> _teardownWebRTC() async {
+    _remoteDescriptionSet = false;
+    _pendingRemoteIce.clear();
+
+    try {
+      _localVideoTrack?.stop();
+    } catch (_) {}
+    _localVideoTrack = null;
+    _videoSender = null;
+
+    try {
+      for (final t in _localAudioStream?.getTracks() ?? const <MediaStreamTrack>[]) {
+        await t.stop();
+      }
+      await _localAudioStream?.dispose();
+    } catch (_) {}
+    _localAudioStream = null;
+
+    if (_renderersReady) {
+      _localRenderer.srcObject = null;
+      _remoteRenderer.srcObject = null;
+    }
+
+    try {
+      await _remoteDisplayStream?.dispose();
+    } catch (_) {}
+    _remoteDisplayStream = null;
+
+    try {
+      await _peerConnection?.close();
+    } catch (_) {}
+    try {
+      await _peerConnection?.dispose();
+    } catch (_) {}
+    _peerConnection = null;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  //  IN-CALL CONTROLS (mic mute, camera on/off, camera flip)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  void _toggleMic() {
+    if (_callPhase != CallPhase.active) return;
+    _micMuted = !_micMuted;
+    for (final t in _localAudioStream?.getAudioTracks() ?? const <MediaStreamTrack>[]) {
+      t.enabled = !_micMuted;
+    }
+    setState(() {});
+  }
+
+  Future<void> _toggleCamera() async {
+    if (_callPhase != CallPhase.active || _videoSender == null) return;
+
+    if (_localVideoOn) {
       try {
-        await _audioRecorder.startRecorder(
-          toStream: _micStreamController!.sink,
-          codec: Codec.pcm16,
-          numChannels: 1,
-          sampleRate: 16000,
-          bufferSize: 8192,
-        );
-      } catch (e2) {
-        _endCall(reason: 'This device could not start the microphone stream: $e2');
+        _localVideoTrack?.stop();
+      } catch (_) {}
+      _localVideoTrack = null;
+      _localRenderer.srcObject = null;
+      try {
+        await _videoSender!.replaceTrack(null);
+      } catch (e) {
+        debugPrint('CALL WEBRTC: replaceTrack(null) not supported on this platform: $e');
+      }
+      setState(() => _localVideoOn = false);
+    } else {
+      try {
+        final stream = await navigator.mediaDevices.getUserMedia({
+          'audio': false,
+          'video': {'facingMode': _usingFrontCamera ? 'user' : 'environment'},
+        });
+        final track = stream.getVideoTracks().first;
+        _localVideoTrack = track;
+        _localRenderer.srcObject = stream;
+        await _videoSender!.replaceTrack(track);
+        setState(() => _localVideoOn = true);
+      } catch (e) {
+        debugPrint('CALL WEBRTC: camera start error: $e');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not start the camera: $e')));
+        }
         return;
       }
     }
 
-    // ── UDP → flutter_pcm_sound buffer ──
-    _callSocketSub = _callSocket!.listen((event) {
-      if (event != RawSocketEvent.read) return;
-      final dg = _callSocket!.receive();
-      if (dg == null || dg.data.isEmpty) return;
-
-      _dbgUdpPacketsRecv++;
-      if (_dbgUdpPacketsRecv == 1 || _dbgUdpPacketsRecv % 40 == 0) {
-        debugPrint('CALL AUDIO: UDP<-network recv packet #$_dbgUdpPacketsRecv (${dg.data.length} bytes) from ${dg.address.address}:${dg.port}, buffer now ${_pcmFeedBuffer.length} bytes');
-      }
-
-      _pcmFeedBuffer.addAll(dg.data);
-
-      // Prevent memory bloat: cap at ~500ms (trim amount rounded down to a
-      // whole number of frames so we never split a 16-bit sample in half)
-      final maxBytes = (sampleRate * bytesPerFrame * 0.5).round();
-      if (_pcmFeedBuffer.length > maxBytes) {
-        int trim = _pcmFeedBuffer.length - maxBytes;
-        trim -= trim % bytesPerFrame;
-        if (trim > 0) _pcmFeedBuffer.removeRange(0, trim);
-      }
-    });
-  }
-
-  // Converts raw little-endian PCM16 bytes (as produced by flutter_sound /
-  // received over the socket) into actual 16-bit sample values. This is
-  // required because PcmArrayInt16.fromList expects one *sample* per list
-  // entry (-32768..32767), not one raw byte per entry.
-  List<int> _bytesToInt16Samples(Uint8List bytes) {
-    final int sampleCount = bytes.length ~/ 2;
-    final byteData = ByteData.sublistView(bytes);
-    final samples = List<int>.filled(sampleCount, 0);
-    for (int i = 0; i < sampleCount; i++) {
-      samples[i] = byteData.getInt16(i * 2, Endian.little);
-    }
-    return samples;
-  }
-
-  int _dbgFeedCalls = 0;
-
-  void _onPcmFeed(int remainingFrames) async {
-    _dbgFeedCalls++;
-    if (_dbgFeedCalls == 1 || _dbgFeedCalls % 40 == 0) {
-      debugPrint('CALL AUDIO: _onPcmFeed called #$_dbgFeedCalls remainingFrames=$remainingFrames isPlaying=$_isPlaying phase=$_callPhase bufferedBytes=${_pcmFeedBuffer.length}');
-    }
-    if (!_isPlaying || _callPhase != CallPhase.active) return;
-
-    final int bytesPerFrame = _activeCallQuality.numChannels * 2;
-    final int bytesNeeded = remainingFrames * bytesPerFrame;
-
-    if (_pcmFeedBuffer.length >= bytesNeeded && bytesNeeded > 0) {
-      final chunk = Uint8List.fromList(_pcmFeedBuffer.sublist(0, bytesNeeded));
-      _pcmFeedBuffer.removeRange(0, bytesNeeded);
+    if (_callPeer != null) {
+      final env = Envelope(
+        type: 'call_video_state',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: _callPeer!.uniqueId,
+        data: {'callId': _callId, 'video': _localVideoOn},
+      );
       try {
-        await FlutterPcmSound.feed(PcmArrayInt16.fromList(_bytesToInt16Samples(chunk)));
-      } catch (e) {
-        debugPrint('PCM FEED ERROR: $e');
-      }
-    } else if (_pcmFeedBuffer.isNotEmpty) {
-      final haveBytes = _pcmFeedBuffer.length;
-      final chunk = Uint8List(bytesNeeded);
-      if (haveBytes > 0) {
-        chunk.setRange(0, haveBytes, Uint8List.fromList(_pcmFeedBuffer));
-        _pcmFeedBuffer.clear();
-      }
-      try {
-        await FlutterPcmSound.feed(PcmArrayInt16.fromList(_bytesToInt16Samples(chunk)));
-      } catch (e) {
-        debugPrint('PCM FEED ERROR: $e');
-      }
-    } else {
-      if (bytesNeeded > 0) {
-        try {
-          await FlutterPcmSound.feed(PcmArrayInt16.fromList(List<int>.filled(bytesNeeded ~/ 2, 0)));
-        } catch (e) {
-          debugPrint('PCM SILENCE FEED ERROR: $e');
-        }
-      }
+        await _sendEnvelope(env);
+      } catch (_) {}
     }
   }
 
-  Future<void> _stopRealtimeAudio() async {
-    _isPlaying = false;
-    _pcmSoundReady = false;
-    _pcmFeedBuffer.clear();
-
+  Future<void> _switchCamera() async {
+    if (_localVideoTrack == null) return;
     try {
-      await FlutterPcmSound.release();
-    } catch (_) {}
-
-    try {
-      await _audioRecorder.stopRecorder();
-    } catch (_) {}
-
-    try {
-      await _callPlayer.stopPlayer();
-    } catch (_) {}
-
-    await _micStreamSub?.cancel();
-    _micStreamSub = null;
-    await _micStreamController?.close();
-    _micStreamController = null;
-    await _callSocketSub?.cancel();
-    _callSocketSub = null;
-    _callSocket?.close();
-    _callSocket = null;
+      await Helper.switchCamera(_localVideoTrack!);
+      _usingFrontCamera = !_usingFrontCamera;
+      setState(() {});
+    } catch (e) {
+      debugPrint('CALL WEBRTC: switch camera error: $e');
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -2501,29 +2582,6 @@ class _HomeScreenState extends State<HomeScreen> {
                         );
                       }),
                     ),
-                    const SizedBox(height: 16),
-                    Text('Call quality', style: TextStyle(color: _fgDim, fontSize: 12, fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 8),
-                    ...CallQuality.values.map((q) {
-                      final selected = q == _callQuality;
-                      return GestureDetector(
-                        onTap: () async {
-                          setState(() => _callQuality = q);
-                          setSheetState(() {});
-                          await SettingsService.setCallQuality(q);
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 6),
-                          child: Row(
-                            children: [
-                              Icon(selected ? Icons.radio_button_checked : Icons.radio_button_off, color: selected ? const Color(0xFF64D2FF) : _fgDim, size: 18),
-                              const SizedBox(width: 10),
-                              Text(q.label, style: TextStyle(color: _fg, fontSize: 13)),
-                            ],
-                          ),
-                        ),
-                      );
-                    }),
                   ],
                 ),
               ),
@@ -3000,40 +3058,89 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildCallOverlay() {
     final peer = _callPeer;
+    final showRemoteVideo = _callPhase == CallPhase.active && _remoteVideoOn && _renderersReady;
+    final showLocalPreview = _callPhase == CallPhase.active && _localVideoOn && _renderersReady;
+
     return Positioned.fill(
-      child: GlassPanel(
-        borderRadius: BorderRadius.zero,
-        opacity: 0.55,
-        isDark: _isDark,
-        child: SafeArea(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const SizedBox(height: 40),
-              Column(
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (showRemoteVideo)
+            RTCVideoView(_remoteRenderer, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)
+          else
+            Container(color: Colors.black),
+          GlassPanel(
+            borderRadius: BorderRadius.zero,
+            opacity: showRemoteVideo ? 0.05 : 0.55,
+            isDark: _isDark,
+            child: SafeArea(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  CircleAvatar(
-                    radius: 54,
-                    backgroundColor: _fgDim.withOpacity(0.2),
-                    backgroundImage: _avatarImage(peer?.avatarBase64),
-                    child: peer?.avatarBase64 == null
-                        ? Text(peer?.displayName.isNotEmpty == true ? peer!.displayName[0].toUpperCase() : '?', style: TextStyle(color: _fg, fontSize: 36))
-                        : null,
-                  ),
-                  const SizedBox(height: 18),
-                  Text(peer?.displayName ?? 'Unknown', style: TextStyle(color: _fg, fontSize: 24, fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 8),
-                  Text(_callStatusLabel(), style: TextStyle(color: _fgDim, fontSize: 14)),
-                  if (_callPhase == CallPhase.active) ...[
-                    const SizedBox(height: 4),
-                    Text('Live · ${_activeCallQuality.label}', style: TextStyle(color: _fgFaint, fontSize: 11)),
-                  ],
+                  const SizedBox(height: 40),
+                  if (!showRemoteVideo)
+                    Column(
+                      children: [
+                        CircleAvatar(
+                          radius: 54,
+                          backgroundColor: _fgDim.withOpacity(0.2),
+                          backgroundImage: _avatarImage(peer?.avatarBase64),
+                          child: peer?.avatarBase64 == null
+                              ? Text(peer?.displayName.isNotEmpty == true ? peer!.displayName[0].toUpperCase() : '?', style: TextStyle(color: _fg, fontSize: 36))
+                              : null,
+                        ),
+                        const SizedBox(height: 18),
+                        Text(peer?.displayName ?? 'Unknown', style: TextStyle(color: _fg, fontSize: 24, fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 8),
+                        Text(_callStatusLabel(), style: TextStyle(color: _fgDim, fontSize: 14)),
+                      ],
+                    )
+                  else
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        CircleAvatar(
+                          radius: 14,
+                          backgroundColor: _fgDim.withOpacity(0.3),
+                          backgroundImage: _avatarImage(peer?.avatarBase64),
+                          child: peer?.avatarBase64 == null
+                              ? Text(peer?.displayName.isNotEmpty == true ? peer!.displayName[0].toUpperCase() : '?', style: const TextStyle(color: Colors.white, fontSize: 12))
+                              : null,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          peer?.displayName ?? 'Unknown',
+                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700, shadows: [Shadow(blurRadius: 8, color: Colors.black)]),
+                        ),
+                      ],
+                    ),
+                  Padding(padding: const EdgeInsets.only(bottom: 48), child: _buildCallControls()),
                 ],
               ),
-              Padding(padding: const EdgeInsets.only(bottom: 48), child: _buildCallControls()),
-            ],
+            ),
           ),
-        ),
+          if (showLocalPreview)
+            Positioned(
+              right: 16,
+              top: 60,
+              child: SafeArea(
+                child: GestureDetector(
+                  onTap: _switchCamera,
+                  child: Container(
+                    width: 96,
+                    height: 132,
+                    clipBehavior: Clip.antiAlias,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: Colors.white.withOpacity(0.6), width: 1.5),
+                      boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 12)],
+                    ),
+                    child: RTCVideoView(_localRenderer, mirror: _usingFrontCamera, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover),
+                  ),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -3075,7 +3182,28 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       );
     }
-    return Row(mainAxisAlignment: MainAxisAlignment.center, children: [_callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: () => _endCall())]);
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        _smallCallButton(icon: _micMuted ? Icons.mic_off : Icons.mic, active: _micMuted, onTap: _toggleMic),
+        const SizedBox(width: 22),
+        _smallCallButton(icon: _localVideoOn ? Icons.videocam : Icons.videocam_off, active: _localVideoOn, onTap: _toggleCamera),
+        const SizedBox(width: 22),
+        _callButton(icon: Icons.call_end, color: Colors.redAccent, onTap: () => _endCall()),
+      ],
+    );
+  }
+
+  Widget _smallCallButton({required IconData icon, required bool active, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 54,
+        height: 54,
+        decoration: BoxDecoration(shape: BoxShape.circle, color: active ? Colors.white.withOpacity(0.9) : Colors.white.withOpacity(0.16)),
+        child: Icon(icon, color: active ? Colors.black87 : Colors.white, size: 24),
+      ),
+    );
   }
 
   Widget _callButton({required IconData icon, required Color color, required VoidCallback onTap}) {
@@ -3094,7 +3222,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _dismissReactionPicker();
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
-    _stopRealtimeAudio();
+    _teardownWebRTC();
+    _localRenderer.dispose();
+    _remoteRenderer.dispose();
     _heartbeatTimer?.cancel();
     _typingDebounceTimer?.cancel();
     _offlineRetryTimer?.cancel();
@@ -3110,7 +3240,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _client.dispose();
     _audioRecorder.closeRecorder();
     _audioPlayer.closePlayer();
-    _callPlayer.closePlayer();
     _textController.dispose();
     super.dispose();
   }
