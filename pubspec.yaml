@@ -43,7 +43,11 @@ dependency_overrides:
   # Required: encryptify pins flutter_secure_storage ^9.2.4,
   # which conflicts with the version this app needs.
   flutter_secure_storage: ^10.3.1
-  # flutter_secure_storage_windows 4.x (pulled in by flutter_secure_storage ^10.3.1)
-  # requires win32 ^6.0.1. The previous pin of "5.15.0" predates win32's v5->v6
-  # breaking change and will fail to compile on Windows. Bumped to match.
-  win32: ^6.3.0
+  # win32 released a breaking v6.0. flutter_secure_storage_windows 4.2.x moved to
+  # win32 ^6.0.1, but file_picker, device_info_plus, share_plus (Windows helper),
+  # and win32_registry are all still written against the win32 5.x API and do not
+  # yet compile against 6.x (see e.g. github.com/miguelpruivo/flutter_file_picker
+  # issue #1980, still open). Pinning flutter_secure_storage_windows back to its
+  # last pre-6.x release avoids dragging the whole tree onto win32 6.x.
+  flutter_secure_storage_windows: 4.1.0
+  win32: 5.15.0
