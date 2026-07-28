@@ -40,4 +40,3 @@ dependency_overrides:
   flutter_secure_storage: ^10.3.1   # Force the newer version
   permission_handler: ^12.0.1
   win32: 5.10.0
-  win32_registry: 1.1.3
