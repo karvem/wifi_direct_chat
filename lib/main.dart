@@ -22,6 +22,41 @@ import 'package:share_plus/share_plus.dart';
 import 'package:cross_file/cross_file.dart';
 import 'debug_logger.dart';
 
+
+import 'package:flutter/services.dart';
+
+class NativeNetworkBinder {
+  static const MethodChannel _channel = MethodChannel('wifi_direct_network_binder');
+
+  /// Bind the whole app process to the network that contains [ipAddress].
+  /// Returns true if successful, false otherwise.
+  static Future<bool> bindToNetwork(String ipAddress) async {
+    try {
+      final result = await _channel.invokeMethod('bindToNetwork', {'ip': ipAddress});
+      return result == true;
+    } catch (e) {
+      debugPrint('bindToNetwork failed: $e');
+      return false;
+    }
+  }
+
+  /// Unbind from the specific network, returning to the system default.
+  static Future<bool> unbindFromNetwork() async {
+    try {
+      final result = await _channel.invokeMethod('unbindFromNetwork');
+      return result == true;
+    } catch (e) {
+      debugPrint('unbindFromNetwork failed: $e');
+      return false;
+    }
+  }
+}
+
+
+
+
+
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MODELS
 // ═══════════════════════════════════════════════════════════════════════════════
