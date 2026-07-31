@@ -1,4 +1,4 @@
-package com.example.wifi_direct_chat   // change if your package is different
+package com.example.wifi_direct_chat   // 如果你的包名不同，请修改这里
 
 import android.net.ConnectivityManager
 import android.net.LinkAddress
@@ -39,14 +39,14 @@ class MainActivity : FlutterActivity() {
     private fun bindToNetwork(ipAddress: String): Boolean {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return false
 
-        // Find the network that has an interface with the given IP
+        // 找到包含该 IP 的网络接口
         val network = cm.allNetworks.firstOrNull { net ->
             val lp = cm.getLinkProperties(net)
             if (lp == null) {
                 false
             } else {
-                // Use explicit Java-style getters to avoid any ambiguity
-                lp.getAddresses().any { addr: LinkAddress ->
+                // 使用正确的方法名 getLinkAddresses()
+                lp.getLinkAddresses().any { addr: LinkAddress ->
                     val inetAddr = addr.getAddress()
                     inetAddr?.hostAddress == ipAddress
                 }
@@ -58,7 +58,7 @@ class MainActivity : FlutterActivity() {
             return false
         }
 
-        // Bind the process to this network
+        // 将进程绑定到这个网络
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 cm.bindProcessToNetwork(network)
