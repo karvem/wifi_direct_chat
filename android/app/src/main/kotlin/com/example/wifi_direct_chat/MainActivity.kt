@@ -1,4 +1,4 @@
-package com.example.wifi_direct_chat   // ← change if your package is different
+package com.example.wifi_direct_chat
 
 import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
@@ -26,7 +26,11 @@ class MainActivity : FlutterActivity() {
     private fun enableWifiDirect(): Boolean {
         return try {
             val networkMonitor = NetworkMonitorAutoDetect.getInstance()
-            val method = networkMonitor.javaClass.getDeclaredMethod("setIncludeWifiDirect", Boolean::class.java)
+            // Use `Boolean::class.javaPrimitiveType` to avoid a type inference warning
+            val method = networkMonitor.javaClass.getDeclaredMethod(
+                "setIncludeWifiDirect",
+                Boolean::class.javaPrimitiveType
+            )
             method.invoke(networkMonitor, true)
             Log.i("NetworkBinder", "✅ WebRTC Wi-Fi Direct enabled")
             true
