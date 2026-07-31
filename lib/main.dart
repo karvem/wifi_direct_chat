@@ -35,7 +35,7 @@ class NativeNetworkBinder {
       final result = await _channel.invokeMethod('bindToNetwork', {'ip': ipAddress});
       return result == true;
     } catch (e) {
-      debugPrint('bindToNetwork failed: $e');
+      logDebug('network_binder', 'bindToNetwork', 'Failed', error: e);
       return false;
     }
   }
@@ -46,7 +46,7 @@ class NativeNetworkBinder {
       final result = await _channel.invokeMethod('unbindFromNetwork');
       return result == true;
     } catch (e) {
-      debugPrint('unbindFromNetwork failed: $e');
+      logDebug('network_binder', 'unbindFromNetwork', 'Failed', error: e);
       return false;
     }
   }
@@ -2287,6 +2287,22 @@ class _HomeScreenState extends State<HomeScreen> {
     // host-candidate pairing unreliable. A public STUN server only produces
     // an *additional* server-reflexive candidate — it doesn't replace the
     // local one — and is skipped automatically if there's no internet path.
+
+  if (_myLanIp != null) {
+    final bound = await NativeNetworkBinder.bindToNetwork(_myLanIp!);
+    if (!bound) {
+      logDebug('voice_call', '_createPeerConnection', 
+          '⚠️ Could not bind to network with IP $_myLanIp, call may fail');
+    } else {
+      logDebug('voice_call', '_createPeerConnection', 
+          '✅ Bound to Wi-Fi Direct network (IP: $_myLanIp)');
+    }
+  } else {
+    logDebug('voice_call', '_createPeerConnection', 
+        '⚠️ No LAN IP available, cannot bind to Wi-Fi Direct network');
+  }
+
+    
     final config = <String, dynamic>{
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
@@ -2413,6 +2429,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _teardownWebRTC() async {
     logDebug('voice_call', '_teardownWebRTC', 'Tearing down WebRTC state');
+     await NativeNetworkBinder.unbindFromNetwork();
     _mediaConnectTimeoutTimer?.cancel();
     _remoteDescriptionSet = false;
     _pendingRemoteIce.clear();
