@@ -20,6 +20,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:cross_file/cross_file.dart';
+import 'debug_logger.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MODELS
@@ -699,6 +700,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _initialize() async {
+    await DebugLogger.instance.init();
+    logDebug('ui', '_initialize', 'App starting');
     await _requestPermissions();
 
     _contactBox = Hive.box<Contact>('contacts');
@@ -737,6 +740,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _startAsHost() async {
     setState(() => _status = 'Starting as Host…');
+    logDebug('p2p', '_startAsHost', 'Starting host role');
     try {
       if (!await _host.checkP2pPermissions()) await _host.askP2pPermissions();
       if (!await _host.checkBluetoothPermissions()) await _host.askBluetoothPermissions();
@@ -747,12 +751,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final state = await _host.createGroup(advertise: true);
       _myLanIp = await LanIp.discover();
+      logDebug('p2p', '_startAsHost', 'Group created. ssid=${state.ssid} myLanIp=$_myLanIp');
       setState(() {
         _role = P2pRole.host;
         _status = 'Host active — SSID: ${state.ssid ?? '…'}';
       });
       _listenAsHost();
     } catch (e) {
+      logDebug('p2p', '_startAsHost', 'Failed to start host', error: e);
       setState(() => _status = 'Could not start host: $e');
     }
   }
@@ -785,6 +791,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _startAsClient() async {
     setState(() => _status = 'Starting as Client…');
+    logDebug('p2p', '_startAsClient', 'Starting client role');
     try {
       if (!await _client.checkP2pPermissions()) await _client.askP2pPermissions();
       if (!await _client.checkBluetoothPermissions()) await _client.askBluetoothPermissions();
@@ -802,6 +809,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       setState(() => _status = 'Scanning for hosts…');
     } catch (e) {
+      logDebug('p2p', '_startAsClient', 'Failed to start client', error: e);
       setState(() => _status = 'Could not start client: $e');
     }
   }
@@ -809,6 +817,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _listenAsClient() {
     _clientStateSub = _client.streamHotspotState().listen((state) async {
       final wasConnected = _isConnected;
+      logDebug('p2p', '_listenAsClient', 'Hotspot state: active=${state.isActive} hostSsid=${state.hostSsid}');
       setState(() {
         _isConnected = state.isActive;
         _status = state.isActive ? 'Connected to ${state.hostSsid ?? 'host'}' : 'Disconnected / Scanning…';
@@ -1936,6 +1945,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _callPeer = peer;
     _callId = const Uuid().v4();
     _iAmCaller = true;
+    logDebug('voice_call', '_startCall', 'Inviting ${peer.displayName} (${peer.uniqueId}), callId=$_callId');
     setState(() => _callPhase = CallPhase.outgoingRinging);
     final env = Envelope(
       type: 'call_invite',
@@ -1947,16 +1957,21 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       await _sendEnvelope(env);
     } catch (e) {
+      logDebug('voice_call', '_startCall', 'Failed to send call_invite', error: e);
       _endCallLocal();
       return;
     }
     _callTimeoutTimer?.cancel();
     _callTimeoutTimer = Timer(const Duration(seconds: 30), () {
-      if (_callPhase == CallPhase.outgoingRinging) _endCall(reason: 'No answer');
+      if (_callPhase == CallPhase.outgoingRinging) {
+        logDebug('voice_call', '_startCall', 'No call_accept received within 30s — timing out');
+        _endCall(reason: 'No answer');
+      }
     });
   }
 
   Future<void> _handleCallInvite(Envelope env) async {
+    logDebug('voice_call', '_handleCallInvite', 'Received invite from ${env.senderId}, callId=${env.data['callId']}, currentPhase=$_callPhase');
     if (_callPhase != CallPhase.idle) {
       final reject = Envelope(
         type: 'call_reject',
@@ -1971,7 +1986,10 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final contact = _contactBox.get(env.senderId);
-    if (contact == null) return;
+    if (contact == null) {
+      logDebug('voice_call', '_handleCallInvite', 'Unknown sender ${env.senderId} — dropping invite (no contact record yet)');
+      return;
+    }
 
     _callPeer = contact;
     _callId = env.data['callId'] as String? ?? const Uuid().v4();
@@ -1987,13 +2005,14 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _acceptCall() async {
     if (_callPhase != CallPhase.incomingRinging || _callPeer == null) return;
+    logDebug('voice_call', '_acceptCall', 'Accepting call from ${_callPeer!.uniqueId}');
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
     setState(() => _callPhase = CallPhase.active);
     try {
       await _createPeerConnection();
-    } catch (e) {
-      debugPrint('CALL WEBRTC: setup error: $e');
+    } catch (e, st) {
+      logDebug('voice_call', '_acceptCall', 'createPeerConnection failed', error: e, stack: st);
       _endCall(reason: 'Could not start the call: $e');
       return;
     }
@@ -2006,11 +2025,15 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     try {
       await _sendEnvelope(env);
-    } catch (_) {}
+      logDebug('voice_call', '_acceptCall', 'Sent call_accept');
+    } catch (e) {
+      logDebug('voice_call', '_acceptCall', 'Failed to send call_accept', error: e);
+    }
   }
 
   Future<void> _declineCall() async {
     if (_callPeer == null) return;
+    logDebug('voice_call', '_declineCall', 'Declining call from ${_callPeer!.uniqueId}');
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
     final env = Envelope(type: 'call_reject', senderId: _myDeviceId, senderName: _myDisplayName, to: _callPeer!.uniqueId, data: {'callId': _callId, 'reason': 'declined'});
@@ -2025,12 +2048,14 @@ class _HomeScreenState extends State<HomeScreen> {
   // in _acceptCall, so it's guaranteed to be ready to receive it).
   Future<void> _handleCallAccept(Envelope env) async {
     if (_callPhase != CallPhase.outgoingRinging || env.data['callId'] != _callId) return;
+    logDebug('voice_call', '_handleCallAccept', 'Peer accepted — creating offer');
     _callTimeoutTimer?.cancel();
     setState(() => _callPhase = CallPhase.active);
     try {
       await _createPeerConnection();
       final offer = await _peerConnection!.createOffer();
       await _peerConnection!.setLocalDescription(offer);
+      logDebug('voice_call', '_handleCallAccept', 'Local offer created and set, sending call_sdp');
       final sdpEnv = Envelope(
         type: 'call_sdp',
         senderId: _myDeviceId,
@@ -2039,8 +2064,8 @@ class _HomeScreenState extends State<HomeScreen> {
         data: {'callId': _callId, 'sdpType': 'offer', 'sdp': offer.sdp},
       );
       await _sendEnvelope(sdpEnv);
-    } catch (e) {
-      debugPrint('CALL WEBRTC: offer error: $e');
+    } catch (e, st) {
+      logDebug('voice_call', '_handleCallAccept', 'Offer creation/send failed', error: e, stack: st);
       _endCall(reason: 'Could not start the call: $e');
     }
   }
@@ -2050,14 +2075,16 @@ class _HomeScreenState extends State<HomeScreen> {
     final sdpType = env.data['sdpType'] as String?;
     final sdp = env.data['sdp'] as String?;
     if (sdp == null || sdpType == null) return;
+    logDebug('voice_call', '_handleSdpEnvelope', 'Received $sdpType from ${env.senderId}, sdp length=${sdp.length}');
     try {
       await _peerConnection!.setRemoteDescription(RTCSessionDescription(sdp, sdpType));
       _remoteDescriptionSet = true;
+      logDebug('voice_call', '_handleSdpEnvelope', 'Remote description set. Flushing ${_pendingRemoteIce.length} queued ICE candidate(s)');
       for (final c in _pendingRemoteIce) {
         try {
           await _peerConnection!.addCandidate(c);
         } catch (e) {
-          debugPrint('CALL WEBRTC: queued addCandidate error: $e');
+          logDebug('voice_call', '_handleSdpEnvelope', 'Queued addCandidate error', error: e);
         }
       }
       _pendingRemoteIce.clear();
@@ -2065,6 +2092,7 @@ class _HomeScreenState extends State<HomeScreen> {
       if (sdpType == 'offer') {
         final answer = await _peerConnection!.createAnswer();
         await _peerConnection!.setLocalDescription(answer);
+        logDebug('voice_call', '_handleSdpEnvelope', 'Answer created and set, sending call_sdp');
         final answerEnv = Envelope(
           type: 'call_sdp',
           senderId: _myDeviceId,
@@ -2074,8 +2102,8 @@ class _HomeScreenState extends State<HomeScreen> {
         );
         await _sendEnvelope(answerEnv);
       }
-    } catch (e) {
-      debugPrint('CALL WEBRTC: SDP handling error: $e');
+    } catch (e, st) {
+      logDebug('voice_call', '_handleSdpEnvelope', 'SDP handling error', error: e, stack: st);
     }
   }
 
@@ -2084,11 +2112,12 @@ class _HomeScreenState extends State<HomeScreen> {
     final candidate = env.data['candidate'] as String?;
     if (candidate == null) return;
     final ice = RTCIceCandidate(candidate, env.data['sdpMid'] as String?, env.data['sdpMLineIndex'] as int?);
+    logDebug('voice_call', '_handleIceEnvelope', 'Remote candidate from ${env.senderId}: $candidate (remoteDescSet=$_remoteDescriptionSet)');
     if (_remoteDescriptionSet) {
       try {
         await _peerConnection!.addCandidate(ice);
       } catch (e) {
-        debugPrint('CALL WEBRTC: addCandidate error: $e');
+        logDebug('voice_call', '_handleIceEnvelope', 'addCandidate error', error: e);
       }
     } else {
       _pendingRemoteIce.add(ice);
@@ -2098,6 +2127,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _handleVideoStateEnvelope(Envelope env) {
     if (env.data['callId'] != _callId) return;
     final on = env.data['video'] == true;
+    logDebug('video_call', '_handleVideoStateEnvelope', 'Remote video state changed to $on');
     // Deliberately NOT touching _remoteRenderer.srcObject here: onTrack only
     // fires once for this transceiver (it's never re-added), so later camera
     // toggles from the peer are just replaceTrack() calls that don't refire
@@ -2109,12 +2139,14 @@ class _HomeScreenState extends State<HomeScreen> {
   void _handleCallReject(Envelope env) {
     if (env.data['callId'] != _callId) return;
     final reason = env.data['reason'] as String? ?? 'declined';
+    logDebug('voice_call', '_handleCallReject', 'Call rejected: $reason');
     if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Call $reason')));
     _endCallLocal();
   }
 
   void _handleCallEnd(Envelope env) {
     if (env.data['callId'] != _callId) return;
+    logDebug('voice_call', '_handleCallEnd', 'Peer ended the call');
     _endCallLocal();
   }
 
@@ -2124,6 +2156,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _handleCallForceStart(Envelope env) async {
     final incomingCallId = env.data['callId'] as String?;
     if (_callId.isNotEmpty && incomingCallId != null && incomingCallId != _callId) return;
+    logDebug('voice_call', '_handleCallForceStart', 'Received forced offer from ${env.senderId}');
 
     _ringTimer?.cancel();
     _callTimeoutTimer?.cancel();
@@ -2139,7 +2172,8 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _callPhase = CallPhase.active);
     try {
       await _createPeerConnection();
-    } catch (e) {
+    } catch (e, st) {
+      logDebug('voice_call', '_handleCallForceStart', 'createPeerConnection failed', error: e, stack: st);
       _endCall(reason: 'Could not start the call: $e');
       return;
     }
@@ -2158,6 +2192,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _emergencyForceStart() async {
     if (_callPhase != CallPhase.outgoingRinging || _callPeer == null) return;
+    logDebug('voice_call', '_emergencyForceStart', 'Bypassing call_accept wait, pushing offer directly');
     _callTimeoutTimer?.cancel();
     setState(() => _callPhase = CallPhase.active);
     try {
@@ -2172,12 +2207,14 @@ class _HomeScreenState extends State<HomeScreen> {
         data: {'callId': _callId, 'sdp': offer.sdp},
       );
       await _sendEnvelope(env);
-    } catch (e) {
+    } catch (e, st) {
+      logDebug('voice_call', '_emergencyForceStart', 'Failed', error: e, stack: st);
       _endCall(reason: 'Could not start the call: $e');
     }
   }
 
   Future<void> _endCall({String? reason}) async {
+    logDebug('voice_call', '_endCall', 'Ending call. reason=$reason');
     if (_callPeer != null) {
       final env = Envelope(type: 'call_end', senderId: _myDeviceId, senderName: _myDisplayName, to: _callPeer!.uniqueId, data: {'callId': _callId});
       try {
@@ -2229,9 +2266,11 @@ class _HomeScreenState extends State<HomeScreen> {
     };
 
     final pc = await createPeerConnection(config, constraints);
+    logDebug('voice_call', '_createPeerConnection', 'RTCPeerConnection created');
 
     pc.onIceCandidate = (RTCIceCandidate? candidate) {
       if (candidate == null || candidate.candidate == null || _callPeer == null) return;
+      logDebug('voice_call', 'onIceCandidate', 'Local candidate: ${candidate.candidate}');
       final env = Envelope(
         type: 'call_ice',
         senderId: _myDeviceId,
@@ -2244,11 +2283,21 @@ class _HomeScreenState extends State<HomeScreen> {
           'sdpMLineIndex': candidate.sdpMLineIndex,
         },
       );
-      _sendEnvelope(env).catchError((_) {});
+      _sendEnvelope(env).catchError((e) {
+        logDebug('voice_call', 'onIceCandidate', 'Failed to send call_ice', error: e);
+      });
+    };
+
+    pc.onIceGatheringState = (RTCIceGatheringState state) {
+      logDebug('voice_call', 'onIceGatheringState', 'ICE gathering state = $state');
+    };
+
+    pc.onIceConnectionState = (RTCIceConnectionState state) {
+      logDebug('voice_call', 'onIceConnectionState', 'ICE connection state = $state');
     };
 
     pc.onTrack = (RTCTrackEvent event) async {
-      debugPrint('CALL WEBRTC: onTrack kind=${event.track.kind} streams=${event.streams.length}');
+      logDebug('video_call', 'onTrack', 'kind=${event.track.kind} streams=${event.streams.length}');
       if (event.track.kind != 'video') return;
       // Because the video transceiver is created up front with no track
       // attached (so camera toggling never needs renegotiation), the track
@@ -2263,7 +2312,7 @@ class _HomeScreenState extends State<HomeScreen> {
         try {
           await _remoteDisplayStream!.addTrack(event.track);
         } catch (e) {
-          debugPrint('CALL WEBRTC: could not attach stream-less track: $e');
+          logDebug('video_call', 'onTrack', 'Could not attach stream-less track', error: e);
         }
         _remoteRenderer.srcObject = _remoteDisplayStream;
       }
@@ -2273,7 +2322,7 @@ class _HomeScreenState extends State<HomeScreen> {
     };
 
     pc.onConnectionState = (RTCPeerConnectionState state) {
-      debugPrint('CALL WEBRTC: connection state = $state');
+      logDebug('voice_call', 'onConnectionState', 'Peer connection state = $state');
       if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
         _mediaConnectTimeoutTimer?.cancel();
       } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
@@ -2281,6 +2330,7 @@ class _HomeScreenState extends State<HomeScreen> {
         // negotiation left the call UI stuck showing "On call" with no
         // audio/video and no explanation. Surface it and hang up instead.
         if (mounted && _callPhase == CallPhase.active) {
+          logDebug('voice_call', 'onConnectionState', 'Connection FAILED — ending call');
           _endCall(reason: 'Call connection failed — check both devices are still on the same network');
         }
       }
@@ -2298,11 +2348,18 @@ class _HomeScreenState extends State<HomeScreen> {
     _mediaConnectTimeoutTimer?.cancel();
     _mediaConnectTimeoutTimer = Timer(const Duration(seconds: 15), () {
       if (_callPhase == CallPhase.active && mounted) {
+        logDebug('voice_call', '_createPeerConnection', 'Connect timeout (15s) — never reached "connected"');
         _endCall(reason: 'Could not establish the call connection (timed out)');
       }
     });
 
-    _localAudioStream = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+    try {
+      _localAudioStream = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+      logDebug('voice_call', '_createPeerConnection', 'getUserMedia(audio) ok, tracks=${_localAudioStream!.getAudioTracks().length}');
+    } catch (e, st) {
+      logDebug('voice_call', '_createPeerConnection', 'getUserMedia(audio) FAILED — check RECORD_AUDIO permission/manifest', error: e, stack: st);
+      rethrow;
+    }
     for (final track in _localAudioStream!.getAudioTracks()) {
       track.enabled = !_micMuted;
       await pc.addTrack(track, _localAudioStream!);
@@ -2316,9 +2373,11 @@ class _HomeScreenState extends State<HomeScreen> {
       init: RTCRtpTransceiverInit(direction: TransceiverDirection.SendRecv),
     );
     _videoSender = videoTransceiver.sender;
+    logDebug('voice_call', '_createPeerConnection', 'Setup complete, video transceiver ready');
   }
 
   Future<void> _teardownWebRTC() async {
+    logDebug('voice_call', '_teardownWebRTC', 'Tearing down WebRTC state');
     _mediaConnectTimeoutTimer?.cancel();
     _remoteDescriptionSet = false;
     _pendingRemoteIce.clear();
@@ -2363,6 +2422,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _toggleMic() {
     if (_callPhase != CallPhase.active) return;
     _micMuted = !_micMuted;
+    logDebug('voice_call', '_toggleMic', 'Mic muted = $_micMuted');
     for (final t in _localAudioStream?.getAudioTracks() ?? const <MediaStreamTrack>[]) {
       t.enabled = !_micMuted;
     }
@@ -2371,6 +2431,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _toggleCamera() async {
     if (_callPhase != CallPhase.active || _videoSender == null) return;
+    logDebug('video_call', '_toggleCamera', 'Toggling camera, currently on=$_localVideoOn');
 
     if (_localVideoOn) {
       try {
@@ -2381,7 +2442,7 @@ class _HomeScreenState extends State<HomeScreen> {
       try {
         await _videoSender!.replaceTrack(null);
       } catch (e) {
-        debugPrint('CALL WEBRTC: replaceTrack(null) not supported on this platform: $e');
+        logDebug('video_call', '_toggleCamera', 'replaceTrack(null) not supported on this platform', error: e);
       }
       setState(() => _localVideoOn = false);
     } else {
@@ -2395,8 +2456,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _localRenderer.srcObject = stream;
         await _videoSender!.replaceTrack(track);
         setState(() => _localVideoOn = true);
-      } catch (e) {
-        debugPrint('CALL WEBRTC: camera start error: $e');
+        logDebug('video_call', '_toggleCamera', 'Camera started ok');
+      } catch (e, st) {
+        logDebug('video_call', '_toggleCamera', 'getUserMedia(video) FAILED — check CAMERA permission/manifest', error: e, stack: st);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not start the camera: $e')));
         }
@@ -2425,7 +2487,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _usingFrontCamera = !_usingFrontCamera;
       setState(() {});
     } catch (e) {
-      debugPrint('CALL WEBRTC: switch camera error: $e');
+      logDebug('video_call', '_switchCamera', 'Failed to switch camera', error: e);
     }
   }
 
@@ -2770,7 +2832,16 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
             const SizedBox(height: 28),
-            Padding(padding: const EdgeInsets.symmetric(horizontal: 40), child: Text(_status, style: TextStyle(color: _fgFaint, fontSize: 12), textAlign: TextAlign.center)),
+            GestureDetector(
+              // Long-press the status line to export every debug_logs/*.txt
+              // file via the normal share sheet — nothing else on this
+              // screen depends on this gesture, so it's a safe place for it.
+              onLongPress: () {
+                logDebug('ui', 'HomeScreen', 'Exporting debug logs via long-press');
+                DebugLogger.instance.shareAll();
+              },
+              child: Padding(padding: const EdgeInsets.symmetric(horizontal: 40), child: Text(_status, style: TextStyle(color: _fgFaint, fontSize: 12), textAlign: TextAlign.center)),
+            ),
           ],
         ),
       ),
