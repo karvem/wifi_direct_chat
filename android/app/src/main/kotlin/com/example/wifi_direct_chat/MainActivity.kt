@@ -1,4 +1,4 @@
-package com.example.wifi_direct_chat   // ⚠️ change if your package is different
+package com.example.wifi_direct_chat   // change if your package is different
 
 import android.net.ConnectivityManager
 import android.net.LinkAddress
@@ -41,13 +41,14 @@ class MainActivity : FlutterActivity() {
 
         // Find the network that has an interface with the given IP
         val network = cm.allNetworks.firstOrNull { net ->
-            val lp: LinkProperties? = cm.getLinkProperties(net)
+            val lp = cm.getLinkProperties(net)
             if (lp == null) {
                 false
             } else {
-                // Use getAddresses() and getAddress() explicitly
-                lp.addresses.any { addr: LinkAddress ->
-                    addr.address?.hostAddress == ipAddress
+                // Use explicit Java-style getters to avoid any ambiguity
+                lp.getAddresses().any { addr: LinkAddress ->
+                    val inetAddr = addr.getAddress()
+                    inetAddr?.hostAddress == ipAddress
                 }
             }
         }
