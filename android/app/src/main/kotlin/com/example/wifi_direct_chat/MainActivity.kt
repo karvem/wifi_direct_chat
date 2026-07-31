@@ -4,7 +4,7 @@ import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import org.webrtc.NetworkMonitorAutoDetect
+import org.webrtc.NetworkMonitor
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "wifi_direct_network_binder"
@@ -25,13 +25,16 @@ class MainActivity : FlutterActivity() {
 
     private fun enableWifiDirect(): Boolean {
         return try {
-            val networkMonitor = NetworkMonitorAutoDetect.getInstance()
-            // Use `Boolean::class.javaPrimitiveType` to avoid a type inference warning
-            val method = networkMonitor.javaClass.getDeclaredMethod(
-                "setIncludeWifiDirect",
-                Boolean::class.javaPrimitiveType
-            )
-            method.invoke(networkMonitor, true)
+            // Get the NetworkMonitor instance, then access its autoDetector
+            val networkMonitor = NetworkMonitor.getInstance()
+            val autoDetector = networkMonitor.javaClass.getDeclaredField("autoDetector")
+            autoDetector.isAccessible = true
+            val detector = autoDetector.get(networkMonitor)
+
+            // Call setIncludeWifiDirect(true) on the autoDetector
+            val method = detector.javaClass.getDeclaredMethod("setIncludeWifiDirect", Boolean::class.javaPrimitiveType)
+            method.invoke(detector, true)
+
             Log.i("NetworkBinder", "✅ WebRTC Wi-Fi Direct enabled")
             true
         } catch (e: Exception) {
