@@ -610,6 +610,18 @@ class _HomeScreenState extends State<HomeScreen> {
   final Map<String, ReceivableFileInfo> _pendingReceivableInfo = {};
   final Set<String> _handledFileIds = {};
 
+  // Voice messages are sent as base64 chunks over the same text channel used
+  // for chat/ping/hello (broadcastText), instead of through the P2P plugin's
+  // file-server transfer (broadcastFile/downloadFile). That file transfer
+  // path relies on the *sender's* device advertising a reachable IP:port for
+  // the other side to connect back to, which in testing only reliably works
+  // from the host side — clients (especially ones that still have mobile
+  // data active alongside the Wi-Fi Direct connection) can end up
+  // advertising an address the host can't reach. The text channel doesn't
+  // have that problem since it's relayed the same way regardless of role.
+  final Map<String, List<String?>> _incomingVoiceChunks = {};
+  final Map<String, Map<String, dynamic>> _incomingVoiceMeta = {};
+
   final FlutterSoundRecorder _audioRecorder = FlutterSoundRecorder();
   final FlutterSoundPlayer _audioPlayer = FlutterSoundPlayer();
   bool _isRecordingVoiceMessage = false;
@@ -630,6 +642,7 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _iAmCaller = false; // I sent the call_invite (relevant for future glare-handling)
   Timer? _ringTimer;
   Timer? _callTimeoutTimer;
+  Timer? _mediaConnectTimeoutTimer; // fires if ICE/DTLS never reaches "connected"
 
   RTCPeerConnection? _peerConnection;
   MediaStream? _localAudioStream; // mic, present for the whole call
@@ -1108,6 +1121,15 @@ class _HomeScreenState extends State<HomeScreen> {
       case 'call_video_state':
         _handleVideoStateEnvelope(env);
         break;
+      case 'voice_start':
+        _handleVoiceStart(env);
+        break;
+      case 'voice_chunk':
+        _handleVoiceChunk(env);
+        break;
+      case 'voice_end':
+        _handleVoiceEnd(env);
+        break;
     }
   }
 
@@ -1410,23 +1432,111 @@ class _HomeScreenState extends State<HomeScreen> {
     _pulseSignal.fire();
 
     try {
-      final file = File(finalPath);
-      final info = _role == P2pRole.host ? await _host.broadcastFile(file) : await _client.broadcastFile(file);
-      if (info == null) {
-        setState(() => _status = 'Voice note failed to send — check the debug console for the real exception');
-        return;
-      }
-      final env = Envelope(
-        type: 'file_notice',
-        senderId: _myDeviceId,
-        senderName: _myDisplayName,
-        to: peer.uniqueId,
-        data: {'fileId': info.id, 'kind': 'voice'},
-      );
-      await _sendEnvelope(env);
+      await _sendVoiceMessageOverText(finalPath, msg.id, peer);
     } catch (e) {
       debugPrint('VOICE SEND ERROR: $e');
       setState(() => _status = 'Voice note failed: $e');
+    }
+  }
+
+  // Sends a recorded voice note as base64 chunks over the same broadcastText
+  // channel used for chat messages (see the field comment on
+  // _incomingVoiceChunks for why this doesn't use broadcastFile).
+  Future<void> _sendVoiceMessageOverText(String path, String voiceId, Contact peer) async {
+    final bytes = await File(path).readAsBytes();
+    final b64 = base64Encode(bytes);
+    const chunkSize = 16000; // base64 chars per chunk (~12KB of audio per chunk)
+    final rawChunkCount = (b64.length / chunkSize).ceil();
+    final totalChunks = rawChunkCount < 1 ? 1 : rawChunkCount; // int, not num — List.filled() needs int
+    final ext = path.split('.').last;
+
+    await _sendEnvelope(Envelope(
+      type: 'voice_start',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: peer.uniqueId,
+      data: {'voiceId': voiceId, 'ext': ext, 'totalChunks': totalChunks},
+    ));
+
+    for (var i = 0; i < totalChunks; i++) {
+      final start = i * chunkSize;
+      final end = math.min(start + chunkSize, b64.length);
+      await _sendEnvelope(Envelope(
+        type: 'voice_chunk',
+        senderId: _myDeviceId,
+        senderName: _myDisplayName,
+        to: peer.uniqueId,
+        data: {'voiceId': voiceId, 'index': i, 'data': b64.substring(start, end)},
+      ));
+    }
+
+    await _sendEnvelope(Envelope(
+      type: 'voice_end',
+      senderId: _myDeviceId,
+      senderName: _myDisplayName,
+      to: peer.uniqueId,
+      data: {'voiceId': voiceId},
+    ));
+  }
+
+  void _handleVoiceStart(Envelope env) {
+    final voiceId = env.data['voiceId'] as String?;
+    final totalChunks = env.data['totalChunks'] as int?;
+    final ext = env.data['ext'] as String? ?? 'aac';
+    if (voiceId == null || totalChunks == null || totalChunks <= 0) return;
+    _incomingVoiceMeta[voiceId] = {'senderId': env.senderId, 'ext': ext, 'timestamp': env.timestamp};
+    _incomingVoiceChunks[voiceId] = List<String?>.filled(totalChunks, null);
+  }
+
+  void _handleVoiceChunk(Envelope env) {
+    final voiceId = env.data['voiceId'] as String?;
+    final index = env.data['index'] as int?;
+    final data = env.data['data'] as String?;
+    if (voiceId == null || index == null || data == null) return;
+    final chunks = _incomingVoiceChunks[voiceId];
+    if (chunks == null || index < 0 || index >= chunks.length) return;
+    chunks[index] = data;
+  }
+
+  Future<void> _handleVoiceEnd(Envelope env) async {
+    final voiceId = env.data['voiceId'] as String?;
+    if (voiceId == null) return;
+    final chunks = _incomingVoiceChunks[voiceId];
+    final meta = _incomingVoiceMeta[voiceId];
+    if (chunks == null || meta == null || chunks.any((c) => c == null)) {
+      debugPrint('VOICE RECEIVE ERROR: incomplete chunks for $voiceId (${chunks?.where((c) => c == null).length ?? '?'} missing)');
+      _incomingVoiceChunks.remove(voiceId);
+      _incomingVoiceMeta.remove(voiceId);
+      return;
+    }
+    try {
+      final bytes = base64Decode(chunks.join());
+      final dir = await getTemporaryDirectory();
+      final ext = meta['ext'] as String;
+      final path = '${dir.path}/voice_in_${DateTime.now().millisecondsSinceEpoch}.$ext';
+      await File(path).writeAsBytes(bytes);
+
+      final senderId = meta['senderId'] as String;
+      final msg = ChatMessage(
+        id: voiceId,
+        contactId: senderId,
+        text: '🎤 Voice message',
+        isMine: false,
+        timestamp: DateTime.fromMillisecondsSinceEpoch(meta['timestamp'] as int),
+        type: 'voice',
+        filePath: path,
+        isRead: false,
+        status: 'delivered',
+      );
+      setState(() => _messages.add(msg));
+      await _messageBox.put(msg.id, msg);
+      _pulseSignal.fire();
+      if (_selectedContact?.uniqueId == senderId) await _markThreadRead(senderId);
+    } catch (e) {
+      debugPrint('VOICE RECEIVE ERROR: $e');
+    } finally {
+      _incomingVoiceChunks.remove(voiceId);
+      _incomingVoiceMeta.remove(voiceId);
     }
   }
 
@@ -2098,10 +2208,19 @@ class _HomeScreenState extends State<HomeScreen> {
   // ─────────────────────────────────────────────────────────────────────────────
 
   Future<void> _createPeerConnection() async {
-    // No STUN/TURN: the Wi-Fi Direct group typically has no internet path
-    // anyway, and both peers are already on the same local subnet, so plain
-    // host ICE candidates are all that's needed to connect directly.
-    final config = <String, dynamic>{'iceServers': <Map<String, dynamic>>[]};
+    // Both peers are normally on the same Wi-Fi Direct subnet, so plain host
+    // ICE candidates are usually enough on their own. STUN servers are still
+    // included as a low-cost fallback: some devices keep mobile data active
+    // alongside the Wi-Fi Direct connection, which can make the plain local
+    // host-candidate pairing unreliable. A public STUN server only produces
+    // an *additional* server-reflexive candidate — it doesn't replace the
+    // local one — and is skipped automatically if there's no internet path.
+    final config = <String, dynamic>{
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'},
+        {'urls': 'stun:stun1.l.google.com:19302'},
+      ],
+    };
     final constraints = <String, dynamic>{
       'mandatory': {},
       'optional': [
@@ -2155,12 +2274,33 @@ class _HomeScreenState extends State<HomeScreen> {
 
     pc.onConnectionState = (RTCPeerConnectionState state) {
       debugPrint('CALL WEBRTC: connection state = $state');
+      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        _mediaConnectTimeoutTimer?.cancel();
+      } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+        // Previously this state was only logged, so a failed ICE/DTLS
+        // negotiation left the call UI stuck showing "On call" with no
+        // audio/video and no explanation. Surface it and hang up instead.
+        if (mounted && _callPhase == CallPhase.active) {
+          _endCall(reason: 'Call connection failed — check both devices are still on the same network');
+        }
+      }
     };
 
     _peerConnection = pc;
     _remoteDescriptionSet = false;
     _pendingRemoteIce.clear();
     _remoteDisplayStream = null;
+
+    // If ICE/DTLS never reaches "connected" at all (e.g. it just sits in
+    // "checking" forever), the state callback above never fires with
+    // anything actionable. This timeout gives the user real feedback
+    // instead of an indefinitely silent "On call" screen.
+    _mediaConnectTimeoutTimer?.cancel();
+    _mediaConnectTimeoutTimer = Timer(const Duration(seconds: 15), () {
+      if (_callPhase == CallPhase.active && mounted) {
+        _endCall(reason: 'Could not establish the call connection (timed out)');
+      }
+    });
 
     _localAudioStream = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
     for (final track in _localAudioStream!.getAudioTracks()) {
@@ -2179,6 +2319,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _teardownWebRTC() async {
+    _mediaConnectTimeoutTimer?.cancel();
     _remoteDescriptionSet = false;
     _pendingRemoteIce.clear();
 
