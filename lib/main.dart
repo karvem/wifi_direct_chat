@@ -28,25 +28,12 @@ import 'package:flutter/services.dart';
 class NativeNetworkBinder {
   static const MethodChannel _channel = MethodChannel('wifi_direct_network_binder');
 
-  /// Bind the whole app process to the network that contains [ipAddress].
-  /// Returns true if successful, false otherwise.
-  static Future<bool> bindToNetwork(String ipAddress) async {
+  static Future<bool> enableWifiDirect() async {
     try {
-      final result = await _channel.invokeMethod('bindToNetwork', {'ip': ipAddress});
+      final result = await _channel.invokeMethod('enableWifiDirect');
       return result == true;
     } catch (e) {
-      logDebug('network_binder', 'bindToNetwork', 'Failed', error: e);
-      return false;
-    }
-  }
-
-  /// Unbind from the specific network, returning to the system default.
-  static Future<bool> unbindFromNetwork() async {
-    try {
-      final result = await _channel.invokeMethod('unbindFromNetwork');
-      return result == true;
-    } catch (e) {
-      logDebug('network_binder', 'unbindFromNetwork', 'Failed', error: e);
+      logDebug('network_binder', 'enableWifiDirect', 'Failed', error: e);
       return false;
     }
   }
@@ -2288,19 +2275,7 @@ class _HomeScreenState extends State<HomeScreen> {
     // an *additional* server-reflexive candidate — it doesn't replace the
     // local one — and is skipped automatically if there's no internet path.
 
-  if (_myLanIp != null) {
-    final bound = await NativeNetworkBinder.bindToNetwork(_myLanIp!);
-    if (!bound) {
-      logDebug('voice_call', '_createPeerConnection', 
-          '⚠️ Could not bind to network with IP $_myLanIp, call may fail');
-    } else {
-      logDebug('voice_call', '_createPeerConnection', 
-          '✅ Bound to Wi-Fi Direct network (IP: $_myLanIp)');
-    }
-  } else {
-    logDebug('voice_call', '_createPeerConnection', 
-        '⚠️ No LAN IP available, cannot bind to Wi-Fi Direct network');
-  }
+await NativeNetworkBinder.enableWifiDirect();
 
     
     final config = <String, dynamic>{
@@ -2429,7 +2404,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _teardownWebRTC() async {
     logDebug('voice_call', '_teardownWebRTC', 'Tearing down WebRTC state');
-     await NativeNetworkBinder.unbindFromNetwork();
     _mediaConnectTimeoutTimer?.cancel();
     _remoteDescriptionSet = false;
     _pendingRemoteIce.clear();
