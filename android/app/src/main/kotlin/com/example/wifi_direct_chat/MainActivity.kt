@@ -1,24 +1,19 @@
-package com.example.wifi_direct_chat
+package com.example.wifi_direct_chat   // ⚠️ change if your package is different
 
-import io.flutter.embedding.android.FlutterActivity
-
-// MainActivity.kt
 import android.net.ConnectivityManager
+import android.net.LinkAddress
 import android.net.LinkProperties
 import android.net.Network
-import android.net.NetworkCapabilities
 import android.os.Build
-import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import java.net.InetAddress
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "wifi_direct_network_binder"
     private var boundNetwork: Network? = null
 
-    override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
@@ -44,10 +39,17 @@ class MainActivity : FlutterActivity() {
     private fun bindToNetwork(ipAddress: String): Boolean {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return false
 
-        // Get the Network that has an interface with the given IP
+        // Find the network that has an interface with the given IP
         val network = cm.allNetworks.firstOrNull { net ->
-            val lp = cm.getLinkProperties(net) ?: return@firstOrNull false
-            lp.addresses.any { addr -> addr.address.hostAddress == ipAddress }
+            val lp: LinkProperties? = cm.getLinkProperties(net)
+            if (lp == null) {
+                false
+            } else {
+                // Use getAddresses() and getAddress() explicitly
+                lp.addresses.any { addr: LinkAddress ->
+                    addr.address?.hostAddress == ipAddress
+                }
+            }
         }
 
         if (network == null) {
@@ -56,19 +58,19 @@ class MainActivity : FlutterActivity() {
         }
 
         // Bind the process to this network
-        try {
+        return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 cm.bindProcessToNetwork(network)
             } else {
-                // For older versions we use the deprecated method
+                @Suppress("DEPRECATION")
                 ConnectivityManager.setProcessDefaultNetwork(network)
             }
             boundNetwork = network
             android.util.Log.i("NetworkBinder", "Bound to network: ${network.javaClass.name}")
-            return true
+            true
         } catch (e: Exception) {
             android.util.Log.e("NetworkBinder", "Failed to bind", e)
-            return false
+            false
         }
     }
 
@@ -78,6 +80,7 @@ class MainActivity : FlutterActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 cm.bindProcessToNetwork(null)
             } else {
+                @Suppress("DEPRECATION")
                 ConnectivityManager.setProcessDefaultNetwork(null)
             }
             boundNetwork = null
