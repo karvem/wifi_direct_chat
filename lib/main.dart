@@ -1,4 +1,5 @@
-import 'dart:async'; 
+
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert' hide Codec;
 import 'dart:io';
@@ -21,28 +22,6 @@ import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:cross_file/cross_file.dart';
 import 'debug_logger.dart';
-
-
-import 'package:flutter/services.dart';
-
-class NativeNetworkBinder {
-  static const MethodChannel _channel = MethodChannel('wifi_direct_network_binder');
-
-  static Future<bool> enableWifiDirect() async {
-    try {
-      final result = await _channel.invokeMethod('enableWifiDirect');
-      return result == true;
-    } catch (e) {
-      logDebug('network_binder', 'enableWifiDirect', 'Failed', error: e);
-      return false;
-    }
-  }
-}
-
-
-
-
-
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MODELS
@@ -606,6 +585,9 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  // Use a MethodChannel to communicate with Android side (to route WebRTC over Wi-Fi Direct)
+  static const MethodChannel _networkChannel = MethodChannel('com.example.wifi_direct_app/network');
+  
   final TextEditingController _textController = TextEditingController();
   late Box<Contact> _contactBox;
   late Box<ChatMessage> _messageBox;
@@ -633,15 +615,6 @@ class _HomeScreenState extends State<HomeScreen> {
   final Map<String, ReceivableFileInfo> _pendingReceivableInfo = {};
   final Set<String> _handledFileIds = {};
 
-  // Voice messages are sent as base64 chunks over the same text channel used
-  // for chat/ping/hello (broadcastText), instead of through the P2P plugin's
-  // file-server transfer (broadcastFile/downloadFile). That file transfer
-  // path relies on the *sender's* device advertising a reachable IP:port for
-  // the other side to connect back to, which in testing only reliably works
-  // from the host side — clients (especially ones that still have mobile
-  // data active alongside the Wi-Fi Direct connection) can end up
-  // advertising an address the host can't reach. The text channel doesn't
-  // have that problem since it's relayed the same way regardless of role.
   final Map<String, List<String?>> _incomingVoiceChunks = {};
   final Map<String, Map<String, dynamic>> _incomingVoiceMeta = {};
 
@@ -2274,10 +2247,6 @@ class _HomeScreenState extends State<HomeScreen> {
     // host-candidate pairing unreliable. A public STUN server only produces
     // an *additional* server-reflexive candidate — it doesn't replace the
     // local one — and is skipped automatically if there's no internet path.
-
-await NativeNetworkBinder.enableWifiDirect();
-
-    
     final config = <String, dynamic>{
       'iceServers': [
         {'urls': 'stun:stun.l.google.com:19302'},
@@ -2290,6 +2259,16 @@ await NativeNetworkBinder.enableWifiDirect();
         {'DtlsSrtpKeyAgreement': true},
       ],
     };
+
+    // --- FIX: BIND PROCESS TO WIFI DIRECT ---
+    // Force the OS process to route WebRTC traffic over the P2P interface
+    try {
+      final bound = await _networkChannel.invokeMethod<bool>('bindToWifiDirect', {'ip': _myLanIp});
+      logDebug('voice_call', '_createPeerConnection', 'Bound to Wi-Fi Direct network: $bound');
+    } catch (e) {
+      logDebug('voice_call', '_createPeerConnection', 'Failed to bind process to Wi-Fi Direct', error: e);
+    }
+    // ----------------------------------------
 
     final pc = await createPeerConnection(config, constraints);
     logDebug('voice_call', '_createPeerConnection', 'RTCPeerConnection created');
@@ -2404,6 +2383,17 @@ await NativeNetworkBinder.enableWifiDirect();
 
   Future<void> _teardownWebRTC() async {
     logDebug('voice_call', '_teardownWebRTC', 'Tearing down WebRTC state');
+
+    // --- FIX: UNBIND PROCESS ---
+    // Restore the device's normal default network routing
+    try {
+      await _networkChannel.invokeMethod('unbindProcess');
+      logDebug('voice_call', '_teardownWebRTC', 'Unbound process from Wi-Fi Direct network');
+    } catch (e) {
+      logDebug('voice_call', '_teardownWebRTC', 'Failed to unbind process', error: e);
+    }
+    // ---------------------------
+
     _mediaConnectTimeoutTimer?.cancel();
     _remoteDescriptionSet = false;
     _pendingRemoteIce.clear();
