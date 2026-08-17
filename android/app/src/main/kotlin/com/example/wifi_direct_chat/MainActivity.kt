@@ -1,45 +1,64 @@
-package com.example.wifi_direct_chat
+package com.example.wifi_direct_app // TODO: Ensure this matches your actual package name
 
-import android.util.Log
+import android.net.ConnectivityManager
+import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import org.webrtc.NetworkMonitor
 
-class MainActivity : FlutterActivity() {
-    private val CHANNEL = "wifi_direct_network_binder"
+class MainActivity: FlutterActivity() {
+    private val CHANNEL = "com.example.wifi_direct_app/network"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "enableWifiDirect" -> {
-                        val success = enableWifiDirect()
-                        result.success(success)
-                    }
-                    else -> result.notImplemented()
-                }
+        
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+            if (call.method == "bindToWifiDirect") {
+                val ip = call.argument<String>("ip")
+                val success = bindToWifiDirect(ip)
+                result.success(success)
+            } else if (call.method == "unbindProcess") {
+                unbindProcess()
+                result.success(true)
+            } else {
+                result.notImplemented()
             }
+        }
     }
 
-    private fun enableWifiDirect(): Boolean {
-        return try {
-            // Get the NetworkMonitor instance, then access its autoDetector
-            val networkMonitor = NetworkMonitor.getInstance()
-            val autoDetector = networkMonitor.javaClass.getDeclaredField("autoDetector")
-            autoDetector.isAccessible = true
-            val detector = autoDetector.get(networkMonitor)
+    private fun bindToWifiDirect(targetIp: String?): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            val networks = cm.allNetworks
+            for (network in networks) {
+                val linkProperties = cm.getLinkProperties(network)
+                if (linkProperties != null) {
+                    // Check if the interface is a P2P interface OR if it owns our LAN IP
+                    val hasP2pInterface = linkProperties.interfaceName?.contains("p2p") == true
+                    var hasTargetIp = false
+                    
+                    if (targetIp != null) {
+                        for (linkAddress in linkProperties.linkAddresses) {
+                            if (linkAddress.address.hostAddress == targetIp) {
+                                hasTargetIp = true
+                                break
+                            }
+                        }
+                    }
+                    
+                    if (hasP2pInterface || hasTargetIp) {
+                        return cm.bindProcessToNetwork(network)
+                    }
+                }
+            }
+        }
+        return false
+    }
 
-            // Call setIncludeWifiDirect(true) on the autoDetector
-            val method = detector.javaClass.getDeclaredMethod("setIncludeWifiDirect", Boolean::class.javaPrimitiveType)
-            method.invoke(detector, true)
-
-            Log.i("NetworkBinder", "✅ WebRTC Wi-Fi Direct enabled")
-            true
-        } catch (e: Exception) {
-            Log.e("NetworkBinder", "❌ Failed to enable Wi-Fi Direct", e)
-            false
+    private fun unbindProcess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.bindProcessToNetwork(null)
         }
     }
 }
